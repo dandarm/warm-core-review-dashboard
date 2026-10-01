@@ -715,12 +715,12 @@ function hideOtherReviews() {
 function formatOtherReview(review) {
   const decision = escapeHtml(review.decision || "-");
   const label = escapeHtml(review.decision === "discard" ? "discard" : (review.reviewed_label || "-"));
-  const notes = review.notes ? `<span>note: ${escapeHtml(review.notes)}</span>` : "";
+  const notes = review.notes ? `<span>Notes: ${escapeHtml(review.notes)}</span>` : "";
   return `
     <div class="reviewer-vote">
       <strong>${escapeHtml(review.reviewer)}</strong>
-      <span>decisione: ${decision}</span>
-      <span>label: ${label}</span>
+      <span>Decision: ${decision}</span>
+      <span>Label: ${label}</span>
       ${notes}
     </div>
   `;
