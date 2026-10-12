@@ -24,6 +24,45 @@ spec.loader.exec_module(dashboard)
 
 
 class StandaloneTests(unittest.TestCase):
+    def test_index_retries_timeout_and_not_found_is_not_retried(self):
+        with patch.object(dashboard.urllib.request, "urlopen", side_effect=[
+            dashboard.urllib.error.URLError(TimeoutError("handshake timed out")),
+            BytesIO(b"ok"),
+        ]) as fetch, patch.object(dashboard.time, "sleep"):
+            self.assertEqual(dashboard.read_atlas_index("https://example.org/"), "ok")
+            self.assertEqual(fetch.call_count, 2)
+        with patch.object(dashboard.urllib.request, "urlopen", side_effect=TimeoutError("offline")) as fetch, patch.object(dashboard.time, "sleep"):
+            with self.assertRaises(TimeoutError):
+                dashboard.read_atlas_index("https://example.org/")
+            self.assertEqual(fetch.call_count, 3)
+        error = dashboard.urllib.error.HTTPError("https://example.org/", 404, "missing", {}, None)
+        with patch.object(dashboard.urllib.request, "urlopen", side_effect=error) as fetch:
+            with self.assertRaises(dashboard.urllib.error.HTTPError):
+                dashboard.read_atlas_index("https://example.org/")
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_retry_only_fetches_failed_tracks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
+            def fetch(track):
+                if track == "track00000002":
+                    raise TimeoutError("handshake")
+                return [dict(sample_id=track, label=None, index=0)]
+            tracks = ["track00000001", "track00000002"]
+            with patch.object(dashboard, "atlas_tracks", return_value=tracks):
+                with patch.object(dashboard, "fetch_atlas_track", side_effect=fetch):
+                    dashboard.load_full_atlas(state)
+                self.assertEqual(state.atlas_progress["status"], "error")
+                self.assertEqual(state.samples, [])
+                with patch.object(dashboard, "fetch_atlas_track", return_value=[
+                    dict(sample_id=tracks[1], label=None, index=0)
+                ]) as retry:
+                    dashboard.load_full_atlas(state)
+                retry.assert_called_once_with(tracks[1])
+                self.assertEqual(state.atlas_progress["status"], "ready")
+                self.assertEqual([s["sample_id"] for s in state.samples], tracks)
+
     def test_full_atlas_order_and_failure_preserves_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

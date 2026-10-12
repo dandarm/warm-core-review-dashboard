@@ -51,6 +51,8 @@ class AppState:
     atlas_mode: bool = False
     atlas_progress: dict = field(default_factory=lambda: {"status": "idle", "done": 0, "total": 0})
     atlas_lock: Any = field(default_factory=threading.Lock)
+    atlas_workers: int = 2
+    atlas_cache: dict = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765, help="HTTP port.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the browser automatically.")
     parser.add_argument("--atlas", action="store_true", help="Start with no CSV; connect to the public atlas from the dashboard.")
+    parser.add_argument("--atlas-workers", type=int, choices=range(1, 7), default=2,
+                        help="Parallel atlas requests (1-6, default: 2). Use 1 on slow connections.")
     parser.add_argument(
         "--remote-base-url", default="",
         help="Public atlas URL; uses trackNNNNNNNN/MEDICANES-WC-DC/Images/ instead of local images.",
@@ -183,10 +187,25 @@ class TrackLinks(HTMLParser):
             self.tracks.add(href.rstrip("/"))
 
 
+def read_atlas_index(url):
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            if attempt == 2:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt == 2:
+                raise
+        time.sleep(2 ** (attempt + 1))
+
+
 def atlas_tracks():
-    with urllib.request.urlopen(ATLAS_URL, timeout=30) as response:
-        parser = TrackLinks()
-        parser.feed(response.read().decode("utf-8"))
+    parser = TrackLinks()
+    parser.feed(read_atlas_index(ATLAS_URL))
     return sorted(parser.tracks)
 
 
@@ -195,9 +214,8 @@ def fetch_atlas_track(track):
         raise ValueError("Invalid atlas track.")
     directory = ATLAS_URL + track + "/MEDICANES-WC-DC/Images/"
     try:
-        with urllib.request.urlopen(directory, timeout=30) as response:
-            parser = ImageLinks(directory)
-            parser.feed(response.read().decode("utf-8"))
+        parser = ImageLinks(directory)
+        parser.feed(read_atlas_index(directory))
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             raise
@@ -238,19 +256,26 @@ def load_full_atlas(state):
         tracks = atlas_tracks()
         if not tracks:
             raise ValueError("No tracks found in the atlas.")
-        state.atlas_progress = {"status": "loading", "done": 0, "total": len(tracks)}
-        results = {}
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            pending = {executor.submit(fetch_atlas_track, track): track for track in tracks}
+        results = {track: state.atlas_cache[track] for track in tracks if track in state.atlas_cache}
+        errors = {}
+        state.atlas_progress = {"status": "loading", "done": len(results), "total": len(tracks), "failed": 0}
+        with ThreadPoolExecutor(max_workers=state.atlas_workers) as executor:
+            pending = {executor.submit(fetch_atlas_track, track): track for track in tracks if track not in results}
             for future in as_completed(pending):
                 track = pending[future]
                 try:
                     results[track] = future.result()
+                    state.atlas_cache[track] = results[track]
                 except Exception as exc:
-                    for task in pending:
-                        task.cancel()
-                    raise RuntimeError(f"Could not load {track}: {exc}") from exc
-                state.atlas_progress = {"status": "loading", "done": len(results), "total": len(tracks)}
+                    errors[track] = str(exc)
+                state.atlas_progress = {"status": "loading", "done": len(results) + len(errors),
+                                        "total": len(tracks), "failed": len(errors)}
+        if errors:
+            track = next(iter(errors))
+            raise RuntimeError(
+                f"{len(errors)} tracks could not be loaded. First failure: {track}: {errors[track]}. "
+                f"{len(results)} tracks cached. Press Connect to atlas to retry only missing tracks."
+            )
         set_atlas_samples(state, [sample for track in tracks for sample in results[track]])
         state.atlas_progress = {"status": "ready", "done": len(tracks), "total": len(tracks)}
     except Exception as exc:
@@ -1243,7 +1268,8 @@ async function connectAtlas() {
       const progress = await fetchJson("/api/atlas/status");
       if (progress.status === "error") throw new Error(progress.error);
       if (progress.status === "ready") break;
-      setStatus("Loading atlas: " + progress.done + " / " + progress.total + " tracks");
+      setStatus("Loading atlas: " + progress.done + " / " + progress.total + " tracks" +
+        (progress.failed ? " · " + progress.failed + " failed" : ""));
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     const payload = await fetchJson("/api/samples");
@@ -1408,6 +1434,7 @@ def main() -> int:
         remote_base_url=args.remote_base_url,
     )
     state.atlas_mode = args.atlas
+    state.atlas_workers = args.atlas_workers
     if not args.atlas:
         load_samples(state)
 

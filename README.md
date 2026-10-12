@@ -78,6 +78,18 @@ Only image listings are loaded upfront; images are fetched as displayed.
 Missing image directories are skipped. Other connection failures are
 reported and can be retried; incomplete scans do not replace the dataset.
 
+Atlas loading uses two parallel requests by default. Each index request has
+a 60-second timeout and up to three attempts with increasing delays.
+Successful track indexes remain cached for the lifetime of the server.
+If a scan fails, press **Connect to atlas** again to retry only missing tracks.
+Restarting the server clears this in-memory cache.
+
+For slow networks or SSL handshake timeouts, use one connection at a time:
+
+```bash
+python3 scripts/visual_review_dashboard.py --atlas --atlas-workers 1
+```
+
 Reviews are saved to `reviews/atlas/` in this mode, including when connecting
 from a CSV session. Unlabelled samples have an empty `original_label`;
 new labels use `decision=label`. Discard leaves `reviewed_label` empty.
