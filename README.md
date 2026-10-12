@@ -56,6 +56,58 @@ Supported extensions are lowercase `.jpg`, `.jpeg`, and `.png`.
 All matching images are displayed. The terminal reports the number of samples
 without matching images. Arbitrary image filenames are not supported.
 
+## Public atlas images
+
+### Label directly from the atlas (no CSV)
+
+```bash
+python3 scripts/visual_review_dashboard.py --atlas
+```
+
+Press **Connect to atlas** to load every track's image index. A progress
+counter shows the initial loading status. Samples are grouped by
+date, time and satellite, with no initial label. Confirm your reviewer name,
+then assign **Negative** (0), **Warm core** (1), or **Discard**.
+The previous/next buttons navigate one continuous sequence, automatically
+crossing track boundaries. Completion refers to the entire loaded atlas.
+The sidebar uses a virtualized list: its scrollbar spans the full dataset,
+while only visible rows and a small buffer are rendered. Previous/next
+navigation keeps the selected row visible. Images scroll independently,
+leaving the sample title and review controls in place.
+Only image listings are loaded upfront; images are fetched as displayed.
+Missing image directories are skipped. Other connection failures are
+reported and can be retried; incomplete scans do not replace the dataset.
+
+Reviews are saved to `reviews/atlas/` in this mode, including when connecting
+from a CSV session. Unlabelled samples have an empty `original_label`;
+new labels use `decision=label`. Discard leaves `reviewed_label` empty.
+The `source_csv` field records the atlas URL when no input CSV exists.
+Reconnecting reloads the selected reviewer's saved decisions.
+The dataset is shared by clients connected to the same local server;
+use one browser session per server.
+
+### Use a CSV selection with online images
+
+Use the same input CSV and load images directly from the IFREMER public atlas:
+
+```bash
+python3 scripts/visual_review_dashboard.py examples/samples.csv \
+  --remote-base-url https://data-cersat.ifremer.fr/data/storms/medicanes/storm-atlas/climatology/ \
+  --output-dir reviews/atlas
+```
+
+Replace `examples/samples.csv` with your dataset CSV. In this mode
+`--data-root` is ignored. For example, `Track0841` maps to
+`track00000841/MEDICANES-WC-DC/Images/`. Images are matched by date,
+overpass time and satellite, including names with or without `UTC`.
+Only tracks referenced in the CSV are queried; each directory listing is
+fetched once at startup. The browser loads matching images directly from the
+public site as samples are displayed. An internet connection is required.
+Images are not copied into the project; review CSVs remain local and record
+the image URLs. Missing directories are reported as warnings; connection
+failures stop startup with the failing URL so they are not mistaken for
+missing images. Restart the dashboard to refresh the directory listings.
+
 ## Review files
 
 `reviewer_<name>.csv` stores each reviewer's latest decision for each sample.

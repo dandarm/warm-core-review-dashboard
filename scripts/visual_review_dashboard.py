@@ -18,11 +18,16 @@ import os
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
+import urllib.request
+import urllib.error
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -31,6 +36,7 @@ from typing import Any
 DEFAULT_CSV = Path("examples/samples.csv")
 DEFAULT_DATA_ROOT = Path("examples/images")
 DEFAULT_OUTPUT_DIR = Path("reviews/demo")
+ATLAS_URL = "https://data-cersat.ifremer.fr/data/storms/medicanes/storm-atlas/climatology/"
 
 
 @dataclass
@@ -41,6 +47,10 @@ class AppState:
     output_dir: Path
     samples: list[dict[str, Any]] = field(default_factory=list)
     missing_images: list[str] = field(default_factory=list)
+    remote_base_url: str = ""
+    atlas_mode: bool = False
+    atlas_progress: dict = field(default_factory=lambda: {"status": "idle", "done": 0, "total": 0})
+    atlas_lock: Any = field(default_factory=threading.Lock)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="HTTP host.")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the browser automatically.")
+    parser.add_argument("--atlas", action="store_true", help="Start with no CSV; connect to the public atlas from the dashboard.")
+    parser.add_argument(
+        "--remote-base-url", default="",
+        help="Public atlas URL; uses trackNNNNNNNN/MEDICANES-WC-DC/Images/ instead of local images.",
+    )
     return parser.parse_args()
 
 
@@ -134,10 +149,153 @@ def map_images(data_root: Path, sample_id: str) -> list[Path]:
     return sorted(set(images), key=image_sort_key)
 
 
+class ImageLinks(HTMLParser):
+    def __init__(self, directory: str):
+        super().__init__()
+        self.directory = directory
+        self.images: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        href = dict(attrs).get("href") or ""
+        url = urllib.parse.urljoin(self.directory, href)
+        parsed = urllib.parse.urlsplit(url)
+        base = urllib.parse.urlsplit(self.directory)
+        relative = parsed.path.removeprefix(base.path)
+        if (
+            parsed.scheme == base.scheme and parsed.netloc == base.netloc
+            and parsed.path.startswith(base.path) and "/" not in relative
+            and not parsed.query and not parsed.fragment
+            and Path(relative).suffix.lower() in (".jpg", ".jpeg", ".png")
+        ):
+            self.images.add(url)
+
+
+class TrackLinks(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tracks = set()
+
+    def handle_starttag(self, tag, attrs):
+        href = dict(attrs).get("href") or ""
+        if tag == "a" and re.fullmatch(r"track[0-9]+/", href):
+            self.tracks.add(href.rstrip("/"))
+
+
+def atlas_tracks():
+    with urllib.request.urlopen(ATLAS_URL, timeout=30) as response:
+        parser = TrackLinks()
+        parser.feed(response.read().decode("utf-8"))
+    return sorted(parser.tracks)
+
+
+def fetch_atlas_track(track):
+    if not re.fullmatch(r"track[0-9]+", track):
+        raise ValueError("Invalid atlas track.")
+    directory = ATLAS_URL + track + "/MEDICANES-WC-DC/Images/"
+    try:
+        with urllib.request.urlopen(directory, timeout=30) as response:
+            parser = ImageLinks(directory)
+            parser.feed(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        parser = ImageLinks(directory)
+    groups = {}
+    for url in sorted(parser.images):
+        name = urllib.parse.unquote(urllib.parse.urlsplit(url).path).split("/")[-1]
+        match = re.search(r"_([0-9]{2}-[A-Za-z]{3}-[0-9]{4})_([0-9]{4})(?:UTC)?_(.+)\.(?:jpg|jpeg|png)$", name, re.I)
+        if match:
+            date, hour, platform = match.groups()
+            sample_id = f"Track{int(track[5:]):04d}/WP2300_Output_{date}_{hour}_{platform}.npz"
+            groups.setdefault(sample_id, []).append(url)
+    samples = [
+        dict(index=i, sample_id=key, label=None, unlabelled=1,
+             images=sorted(images, key=lambda url: image_sort_key(Path(url))), metadata={})
+        for i, (key, images) in enumerate(sorted(groups.items()))
+    ]
+    return samples
+
+
+def set_atlas_samples(state, samples):
+    for index, sample in enumerate(samples):
+        sample["index"] = index
+    state.samples = samples
+    state.atlas_mode = True
+    state.remote_base_url = ATLAS_URL
+    state.output_dir = state.repo_root / "reviews/atlas"
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+    state.missing_images = []
+
+
+def load_atlas_track(state, track):
+    set_atlas_samples(state, fetch_atlas_track(track))
+
+
+def load_full_atlas(state):
+    try:
+        tracks = atlas_tracks()
+        if not tracks:
+            raise ValueError("No tracks found in the atlas.")
+        state.atlas_progress = {"status": "loading", "done": 0, "total": len(tracks)}
+        results = {}
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            pending = {executor.submit(fetch_atlas_track, track): track for track in tracks}
+            for future in as_completed(pending):
+                track = pending[future]
+                try:
+                    results[track] = future.result()
+                except Exception as exc:
+                    for task in pending:
+                        task.cancel()
+                    raise RuntimeError(f"Could not load {track}: {exc}") from exc
+                state.atlas_progress = {"status": "loading", "done": len(results), "total": len(tracks)}
+        set_atlas_samples(state, [sample for track in tracks for sample in results[track]])
+        state.atlas_progress = {"status": "ready", "done": len(tracks), "total": len(tracks)}
+    except Exception as exc:
+        state.atlas_progress = {**state.atlas_progress, "status": "error", "error": str(exc)}
+
+
+def map_remote_images(base_url: str, sample_id: str, cache: dict[str, list[str]]) -> list[str]:
+    base = urllib.parse.urlsplit(base_url)
+    if base.scheme not in ("https", "http") or not base.netloc or base.query or base.fragment:
+        raise ValueError("Remote base URL must be an HTTP(S) directory URL without query or fragment.")
+    track, date, overpass_time, platform = sample_key(sample_id)
+    match = re.fullmatch(r"track(\d+)", track, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Cannot extract track number from {sample_id}")
+    directory = (
+        base_url.rstrip("/") + f"/track{int(match[1]):08d}/MEDICANES-WC-DC/Images/"
+    )
+    if directory not in cache:
+        try:
+            with urllib.request.urlopen(directory, timeout=30) as response:
+                parser = ImageLinks(directory)
+                parser.feed(response.read().decode("utf-8"))
+                cache[directory] = sorted(parser.images)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise RuntimeError(f"Cannot read remote image directory {directory}: {exc}") from exc
+            print(f"Warning: remote image directory not found: {directory}", file=sys.stderr)
+            cache[directory] = []
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError(f"Cannot read remote image directory {directory}: {exc}") from exc
+    pattern = re.compile(
+        rf"_{re.escape(date)}_{re.escape(overpass_time)}(?:UTC)?_{re.escape(platform)}\.(?:jpg|jpeg|png)$",
+        re.IGNORECASE,
+    )
+    return sorted(
+        (url for url in cache[directory]
+         if pattern.search(urllib.parse.unquote(urllib.parse.urlsplit(url).path))),
+        key=lambda url: image_sort_key(Path(urllib.parse.urlsplit(url).path)),
+    )
+
+
 def load_samples(state: AppState) -> None:
     if not state.input_csv.exists():
         raise FileNotFoundError(f"Input CSV not found: {state.input_csv}")
-    if not state.data_root.exists():
+    if not state.remote_base_url and not state.data_root.exists():
         raise FileNotFoundError(f"Data root not found: {state.data_root}")
 
     with state.input_csv.open(newline="", encoding="utf-8") as handle:
@@ -150,12 +308,16 @@ def load_samples(state: AppState) -> None:
 
         samples: list[dict[str, Any]] = []
         missing_images: list[str] = []
+        remote_cache: dict[str, list[str]] = {}
         for index, row in enumerate(reader):
             sample_id = row["sample_id"]
-            images = map_images(state.data_root, sample_id)
-            if not images:
+            if state.remote_base_url:
+                image_paths = map_remote_images(state.remote_base_url, sample_id, remote_cache)
+            else:
+                images = map_images(state.data_root, sample_id)
+                image_paths = [display_path(path, state.repo_root) for path in images]
+            if not image_paths:
                 missing_images.append(sample_id)
-            image_paths = [display_path(path, state.repo_root) for path in images]
             samples.append(
                 {
                     "index": index,
@@ -245,24 +407,24 @@ def save_review(state: AppState, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unknown sample_id: {sample_id}")
 
     if action == "discard":
-        reviewed_label = int(payload.get("reviewed_label", sample["label"]))
+        reviewed_label = sample["label"] if sample["label"] is not None else ""
         decision = "discard"
     else:
         reviewed_label = int(payload.get("reviewed_label"))
         if reviewed_label not in (0, 1):
             raise ValueError("reviewed_label must be 0 or 1.")
-        decision = "keep" if reviewed_label == sample["label"] else "switch"
+        decision = "label" if sample["label"] is None else "keep" if reviewed_label == sample["label"] else "switch"
 
     row = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "reviewer": reviewer,
         "sample_id": sample_id,
-        "original_label": str(sample["label"]),
+        "original_label": "" if sample["label"] is None else str(sample["label"]),
         "reviewed_label": str(reviewed_label),
         "decision": decision,
         "notes": notes,
         "unlabelled": str(sample["unlabelled"]),
-        "source_csv": display_path(state.input_csv, state.repo_root),
+        "source_csv": ATLAS_URL if state.atlas_mode else display_path(state.input_csv, state.repo_root),
         "image_paths": "|".join(sample["images"]),
     }
 
@@ -561,6 +723,39 @@ HTML_PAGE = r"""<!doctype html>
         padding-top: 10px;
       }
     }
+    [hidden] { display: none !important; }
+    html { height: 100%; overflow: hidden; }
+    body { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+    header { flex: none; }
+    main { width: 100%; flex: 1; min-height: 0; overflow: hidden; padding-bottom: 16px; }
+    aside, .viewer { min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+    aside { position: static; align-self: stretch; }
+    aside > :not(.sample-list), .sample-head { flex: none; }
+    .sample-list { flex: 1; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; position: relative; overscroll-behavior: contain; }
+    .sample-row { height: 40px; min-height: 40px; grid-template-columns: 18px minmax(0, 1fr) auto; }
+    .sample-list-inner { position: relative; width: 100%; }
+    .sample-list-inner .sample-row { position: absolute; left: 0; }
+    .image-grid { flex: 1; min-height: 0; overflow-y: auto; align-content: start; grid-auto-rows: max-content; overscroll-behavior: contain; scrollbar-gutter: stable; }
+    .reviewer-panel { flex: none; max-height: 25%; overflow: auto; }
+    .sub, .status { overflow-wrap: anywhere; }
+    textarea { max-height: 120px; }
+    @media (max-width: 980px) {
+      main { grid-template-rows: minmax(160px, 38%) minmax(0, 1fr); padding: 8px; gap: 8px; }
+      .topbar { padding: 8px; gap: 6px; }
+      aside, .viewer { padding: 8px; }
+      aside { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); gap: 4px 8px; }
+      aside .progress { margin: 0; }
+      aside .sample-list { grid-column: 2; grid-row: 1 / 5; }
+      aside .status { margin: 0; max-height: 40px; overflow: auto; }
+      aside > div:has(textarea) { min-height: 0; margin: 0 !important; }
+      aside textarea { height: 100%; min-height: 28px; resize: none; }
+      .actions { gap: 4px; }
+      .actions button { padding: 0 6px; }
+      .sample-head { gap: 4px; margin-bottom: 6px; }
+      .sample-head .nav { gap: 4px; }
+      .sample-head button { min-height: 30px; font-size: 12px; }
+      .reviewer { grid-template-columns: 64px minmax(0, 1fr) auto; }
+    }
   </style>
 </head>
 <body>
@@ -568,6 +763,7 @@ HTML_PAGE = r"""<!doctype html>
     <div class="topbar">
       <div>
         <h1>Warm Core Visual Review</h1>
+        <button id="connectAtlas">Connect to atlas</button>
         <div class="sub" id="source"></div>
       </div>
       <div class="reviewer">
@@ -665,7 +861,7 @@ function setStatus(text, cls = "") {
 }
 
 function controlsDisabled() {
-  return !state.reviewerConfirmed;
+  return !state.reviewerConfirmed || !currentSample() || state.loading;
 }
 
 function updateControls() {
@@ -674,10 +870,13 @@ function updateControls() {
   els.switch.disabled = disabled;
   els.discard.disabled = disabled;
   els.notes.disabled = disabled;
+  els.keep.textContent = state.config?.atlas_mode ? "Negative" : "Keep";
+  els.switch.textContent = state.config?.atlas_mode ? "Warm core" : "Switch";
   els.confirmReviewer.textContent = state.reviewerConfirmed ? "Change" : "OK";
 }
 
 function currentList() {
+  if (state.config?.atlas_mode) return state.samples;
   return state.byLabel[state.label] || [];
 }
 
@@ -771,18 +970,35 @@ function refreshOtherReviewsIfVisible() {
 
 function renderList() {
   const list = currentList();
-  els.sampleList.innerHTML = "";
-  list.forEach((sample, i) => {
+  const rowHeight = 40;
+  const start = Math.max(0, Math.floor(els.sampleList.scrollTop / rowHeight) - 6);
+  const count = Math.ceil(els.sampleList.clientHeight / rowHeight) + 12;
+  const inner = document.createElement("div");
+  inner.className = "sample-list-inner";
+  inner.style.height = (list.length * rowHeight) + "px";
+  list.slice(start, start + count).forEach((sample, offset) => {
+    const i = start + offset;
     const button = document.createElement("button");
     button.className = "sample-row" + (i === state.index ? " active" : "") + (state.reviews[sample.sample_id] ? " reviewed" : "");
-    button.innerHTML = `<i class="dot"></i><span>${sample.sample_id}</span><small>${sample.images.length} img</small>`;
+    button.style.top = (i * rowHeight) + "px";
+    button.title = sample.sample_id;
+    button.setAttribute("aria-label", (i + 1) + ": " + sample.sample_id);
+    button.innerHTML = `<i class="dot"></i><span>${escapeHtml(sample.sample_id)}</span><small>${sample.images.length} img</small>`;
     button.addEventListener("click", () => {
       state.index = i;
       render();
       refreshOtherReviewsIfVisible();
     });
-    els.sampleList.appendChild(button);
+    inner.appendChild(button);
   });
+  els.sampleList.replaceChildren(inner);
+}
+
+function revealCurrentSample() {
+  const top = state.index * 40;
+  if (top < els.sampleList.scrollTop) els.sampleList.scrollTop = top;
+  else if (top + 40 > els.sampleList.scrollTop + els.sampleList.clientHeight)
+    els.sampleList.scrollTop = top + 40 - els.sampleList.clientHeight;
 }
 
 function render() {
@@ -801,6 +1017,9 @@ function render() {
     els.sampleTitle.textContent = "No samples";
     els.badges.innerHTML = "";
     els.images.innerHTML = "";
+    els.sampleList.replaceChildren();
+    els.reviewedCount.textContent = "0 reviewed";
+    els.meter.style.width = "0%";
     return;
   }
   state.index = Math.max(0, Math.min(state.index, list.length - 1));
@@ -823,7 +1042,7 @@ function render() {
       : `<span class="badge saved">Saved: ${review.reviewed_label}</span>`;
   }
   els.badges.innerHTML = `
-    <span class="badge label${sample.label}">Original label ${sample.label}</span>
+    <span class="badge label${sample.label}">${sample.label === null ? "Unlabelled" : "Original label " + sample.label}</span>
     <span class="badge">unlabelled ${sample.unlabelled}</span>
     ${reviewedBadge}
   `;
@@ -831,9 +1050,10 @@ function render() {
   els.images.innerHTML = sample.images.map(path => `
     <article class="image-panel">
       <h2>${imageTitle(path)}</h2>
-      <div class="image-wrap"><img src="/image?path=${encodeURIComponent(path)}" alt="${imageTitle(path)}"></div>
+      <div class="image-wrap"><img src="${escapeHtml(/^https?:\/\//.test(path) ? path : '/image?path=' + encodeURIComponent(path))}" alt="${escapeHtml(imageTitle(path))}"></div>
     </article>
   `).join("");
+  revealCurrentSample();
   renderList();
   updateControls();
 }
@@ -958,6 +1178,11 @@ function jumpUnreviewed() {
 }
 
 async function init() {
+  let scrollFrame = 0;
+  els.sampleList.addEventListener("scroll", () => {
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(() => { scrollFrame = 0; renderList(); });
+  });
+  new ResizeObserver(() => renderList()).observe(els.sampleList);
   const savedReviewer = localStorage.getItem("visualReview.reviewer") || "";
   els.reviewer.value = savedReviewer;
   const payload = await fetchJson("/api/samples");
@@ -967,7 +1192,7 @@ async function init() {
     0: state.samples.filter(sample => sample.label === 0),
     1: state.samples.filter(sample => sample.label === 1),
   };
-  els.source.textContent = `${payload.config.input_csv} · ${state.samples.length} samples`;
+  els.source.textContent = `${payload.config.atlas_mode ? "Atlas" : payload.config.input_csv} · ${state.samples.length} samples`;
 
   document.querySelectorAll(".tabs button").forEach(button => {
     button.addEventListener("click", () => setLabel(Number(button.dataset.label)));
@@ -986,8 +1211,8 @@ async function init() {
   });
   els.prev.addEventListener("click", () => next(-1));
   els.next.addEventListener("click", () => next(1));
-  els.keep.addEventListener("click", () => save(currentSample().label));
-  els.switch.addEventListener("click", () => save(currentSample().label === 0 ? 1 : 0));
+  els.keep.addEventListener("click", () => save(state.config.atlas_mode ? 0 : currentSample().label));
+  els.switch.addEventListener("click", () => save(state.config.atlas_mode ? 1 : currentSample().label === 0 ? 1 : 0));
   els.discard.addEventListener("click", () => save(currentSample().label, "discard"));
   els.showOtherReviews.addEventListener("click", toggleOtherReviews);
   els.jumpUnreviewed.addEventListener("click", jumpUnreviewed);
@@ -995,15 +1220,47 @@ async function init() {
     if (event.target.matches("input, textarea")) return;
     if (event.key === "ArrowLeft") next(-1);
     if (event.key === "ArrowRight") next(1);
-    if (!controlsDisabled() && event.key.toLowerCase() === "k") save(currentSample().label);
-    if (!controlsDisabled() && event.key.toLowerCase() === "s") save(currentSample().label === 0 ? 1 : 0);
+    if (!controlsDisabled() && event.key.toLowerCase() === "k") save(state.config.atlas_mode ? 0 : currentSample().label);
+    if (!controlsDisabled() && event.key.toLowerCase() === "s") save(state.config.atlas_mode ? 1 : currentSample().label === 0 ? 1 : 0);
   });
 
   state.reviewerConfirmed = false;
+  document.getElementById("connectAtlas").addEventListener("click", connectAtlas);
+  document.querySelector(".tabs").hidden = !!state.config.atlas_mode;
   setStatus("Enter a reviewer name and press OK to start.");
   render();
 }
 
+async function connectAtlas() {
+  const button = document.getElementById("connectAtlas");
+  button.disabled = true;
+  state.loading = true;
+  updateControls();
+  setStatus("Connecting to atlas...");
+  try {
+    await fetchJson("/api/atlas/connect", {method: "POST"});
+    while (true) {
+      const progress = await fetchJson("/api/atlas/status");
+      if (progress.status === "error") throw new Error(progress.error);
+      if (progress.status === "ready") break;
+      setStatus("Loading atlas: " + progress.done + " / " + progress.total + " tracks");
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    const payload = await fetchJson("/api/samples");
+    state.samples = payload.samples;
+    state.config = payload.config;
+    state.index = 0;
+    state.reviews = {};
+    state.completionAlertShown = false;
+    document.querySelector(".tabs").hidden = true;
+    els.source.textContent = "Atlas · " + state.samples.length + " samples";
+    if (state.reviewerConfirmed) await loadReviews();
+    render();
+    setStatus(state.samples.length ? "Atlas loaded." : "No matching atlas images.");
+    refreshOtherReviewsIfVisible();
+  } catch (error) { setStatus(error.message, "error"); }
+  finally { button.disabled = false; state.loading = false; updateControls(); }
+}
 init().catch(error => setStatus(error.message, "error"));
 </script>
 </body>
@@ -1036,7 +1293,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         try:
-            if parsed.path == "/":
+            if parsed.path == "/api/atlas/status":
+                self.send_json(self.state.atlas_progress)
+            elif parsed.path == "/api/atlas/tracks":
+                self.send_json({"ok": True, "tracks": atlas_tracks()})
+            elif parsed.path == "/":
                 self.send_text(HTML_PAGE)
             elif parsed.path == "/api/samples":
                 self.handle_samples()
@@ -1054,6 +1315,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         try:
+            if parsed.path == "/api/atlas/connect":
+                with self.state.atlas_lock:
+                    if self.state.atlas_progress["status"] not in ("loading", "ready"):
+                        self.state.atlas_progress = {"status": "loading", "done": 0, "total": 0}
+                        threading.Thread(target=load_full_atlas, args=(self.state,), daemon=True).start()
+                self.send_json({"ok": True})
+                return
             if parsed.path != "/api/review":
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
@@ -1075,6 +1343,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "data_root": display_path(state.data_root, state.repo_root),
                     "output_dir": display_path(state.output_dir, state.repo_root),
                     "missing_images": state.missing_images,
+                    "remote_base_url": state.remote_base_url,
+                    "atlas_mode": state.atlas_mode,
                 },
             }
         )
@@ -1135,8 +1405,11 @@ def main() -> int:
         input_csv=resolve_under_root(root, input_csv),
         data_root=resolve_under_root(root, args.data_root),
         output_dir=resolve_under_root(root, args.output_dir),
+        remote_base_url=args.remote_base_url,
     )
-    load_samples(state)
+    state.atlas_mode = args.atlas
+    if not args.atlas:
+        load_samples(state)
 
     DashboardHandler.state = state
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
