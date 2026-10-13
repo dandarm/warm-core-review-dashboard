@@ -24,7 +24,6 @@ import urllib.request
 import urllib.error
 import webbrowser
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from http import HTTPStatus
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +49,7 @@ class AppState:
     remote_base_url: str = ""
     atlas_mode: bool = False
     atlas_lock: Any = field(default_factory=threading.Lock)
+    review_lock: Any = field(default_factory=threading.Lock)
     atlas_cache: dict = field(default_factory=dict)
     atlas_tracks: list[str] = field(default_factory=list)
     atlas_track: str = ""
@@ -107,6 +107,10 @@ def display_path(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
+def without_prefix(value: str, prefix: str) -> str:
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
 def sample_key(sample_id: str) -> tuple[str, str, str, str]:
     parts = Path(sample_id).parts
     if len(parts) < 2:
@@ -114,7 +118,7 @@ def sample_key(sample_id: str) -> tuple[str, str, str, str]:
 
     track = parts[0]
     stem = Path(sample_id).stem
-    key = stem.removeprefix("WP2300_Output_").removeprefix("Thermodynamical_Microphysical_")
+    key = without_prefix(without_prefix(stem, "WP2300_Output_"), "Thermodynamical_Microphysical_")
     fields = key.split("_")
     if len(fields) < 3:
         raise ValueError(f"Cannot extract date, time and platform from sample_id: {sample_id}")
@@ -166,7 +170,7 @@ class ImageLinks(HTMLParser):
         url = urllib.parse.urljoin(self.directory, href)
         parsed = urllib.parse.urlsplit(url)
         base = urllib.parse.urlsplit(self.directory)
-        relative = parsed.path.removeprefix(base.path)
+        relative = without_prefix(parsed.path, base.path)
         if (
             parsed.scheme == base.scheme and parsed.netloc == base.netloc
             and parsed.path.startswith(base.path) and "/" not in relative
@@ -264,6 +268,7 @@ def set_atlas_samples(state, samples):
     state.remote_base_url = ATLAS_URL
     state.output_dir = state.repo_root / "reviews/atlas"
     state.output_dir.mkdir(parents=True, exist_ok=True)
+    migrate_reviews(state.output_dir)
     state.missing_images = []
 
 
@@ -363,6 +368,7 @@ def load_samples(state: AppState) -> None:
     state.samples = samples
     state.missing_images = missing_images
     state.output_dir.mkdir(parents=True, exist_ok=True)
+    migrate_reviews(state.output_dir)
 
 
 def reviewer_slug(reviewer: str) -> str:
@@ -380,22 +386,21 @@ def read_reviewer_rows(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
     with path.open(newline="", encoding="utf-8") as handle:
-        return {row["sample_id"]: row for row in csv.DictReader(handle)}
+        return {row["sample_id"]: {"sample_id": row["sample_id"], "label": stored_label(row)}
+                for row in csv.DictReader(handle)}
+
+
+def stored_label(row: dict[str, str]) -> str:
+    label = row.get("label") if "label" in row else (
+        "discard" if row.get("decision") == "discard" else row.get("reviewed_label", "")
+    )
+    if label not in ("0", "1", "discard"):
+        raise ValueError(f"Invalid saved label for {row.get('sample_id', '')}: {label!r}")
+    return label
 
 
 def write_reviewer_rows(path: Path, rows_by_sample: dict[str, dict[str, str]]) -> None:
-    fieldnames = [
-        "timestamp_utc",
-        "reviewer",
-        "sample_id",
-        "original_label",
-        "reviewed_label",
-        "decision",
-        "notes",
-        "unlabelled",
-        "source_csv",
-        "image_paths",
-    ]
+    fieldnames = ["sample_id", "label"]
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -407,24 +412,67 @@ def write_reviewer_rows(path: Path, rows_by_sample: dict[str, dict[str, str]]) -
 
 def append_audit_log(state: AppState, row: dict[str, str]) -> None:
     path = state.output_dir / "review_events.csv"
-    fieldnames = [
-        "timestamp_utc",
-        "reviewer",
-        "sample_id",
-        "original_label",
-        "reviewed_label",
-        "decision",
-        "notes",
-        "unlabelled",
-        "source_csv",
-        "image_paths",
-    ]
+    fieldnames = ["reviewer", "sample_id", "label"]
     exists = path.exists()
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if not exists:
             writer.writeheader()
         writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
+def notes_file(output_dir: Path) -> Path:
+    return output_dir / "reviewer_notes.json"
+
+
+def read_notes(output_dir: Path) -> dict[str, dict[str, str]]:
+    path = notes_file(output_dir)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def write_notes(output_dir: Path, notes: dict[str, dict[str, str]]) -> None:
+    path = notes_file(output_dir)
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(notes, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def migrate_reviews(output_dir: Path) -> None:
+    notes = read_notes(output_dir)
+    notes_changed = False
+    for path in output_dir.glob("reviewer_*.csv"):
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames == ["sample_id", "label"]:
+                continue
+            rows = list(reader)
+        slug = without_prefix(path.stem, "reviewer_")
+        for row in rows:
+            if row.get("notes"):
+                notes.setdefault(slug, {})[row["sample_id"]] = row["notes"]
+                notes_changed = True
+        if notes_changed:
+            write_notes(output_dir, notes)
+            notes_changed = False
+        write_reviewer_rows(path, {row["sample_id"]: {
+            "sample_id": row["sample_id"], "label": stored_label(row)
+        } for row in rows})
+
+    audit_path = output_dir / "review_events.csv"
+    if audit_path.exists():
+        with audit_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames == ["reviewer", "sample_id", "label"]:
+                return
+            rows = list(reader)
+        tmp_path = audit_path.with_suffix(".csv.tmp")
+        with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["reviewer", "sample_id", "label"])
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({"reviewer": row["reviewer"], "sample_id": row["sample_id"],
+                                 "label": stored_label(row)})
+        tmp_path.replace(audit_path)
 
 
 def save_review(state: AppState, payload: dict[str, Any]) -> dict[str, Any]:
@@ -446,50 +494,57 @@ def save_review(state: AppState, payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("reviewed_label must be 0 or 1.")
         decision = "label" if sample["label"] is None else "keep" if reviewed_label == sample["label"] else "switch"
 
-    row = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "reviewer": reviewer,
-        "sample_id": sample_id,
-        "original_label": "" if sample["label"] is None else str(sample["label"]),
-        "reviewed_label": str(reviewed_label),
-        "decision": decision,
-        "notes": notes,
-        "unlabelled": str(sample["unlabelled"]),
-        "source_csv": ATLAS_URL if state.atlas_mode else display_path(state.input_csv, state.repo_root),
-        "image_paths": "|".join(sample["images"]),
-    }
-
     path = reviewer_file(state, reviewer)
-    rows = read_reviewer_rows(path)
-    rows[sample_id] = row
-    write_reviewer_rows(path, rows)
-    append_audit_log(state, row)
+    row = {"sample_id": sample_id, "label": "discard" if decision == "discard" else str(reviewed_label)}
+    with state.review_lock:
+        state.output_dir.mkdir(parents=True, exist_ok=True)
+        migrate_reviews(state.output_dir)
+        saved_notes = read_notes(state.output_dir)
+        slug = reviewer_slug(reviewer)
+        if notes:
+            saved_notes.setdefault(slug, {})[sample_id] = notes
+        elif slug in saved_notes:
+            saved_notes[slug].pop(sample_id, None)
+        if notes_file(state.output_dir).exists() or notes:
+            write_notes(state.output_dir, saved_notes)
+        rows = read_reviewer_rows(path)
+        rows[sample_id] = row
+        write_reviewer_rows(path, rows)
+        append_audit_log(state, {"reviewer": reviewer, **row})
     return {"ok": True, "decision": decision, "reviewer_file": display_path(path, state.repo_root)}
+
+
+def display_review(state: AppState, row: dict[str, str], notes: str = "") -> dict[str, str]:
+    label = row["label"]
+    original = next((item["label"] for item in state.samples if item["sample_id"] == row["sample_id"]), None)
+    decision = "discard" if label == "discard" else (
+        "label" if original is None else "keep" if int(label) == original else "switch"
+    )
+    return {"reviewed_label": "" if label == "discard" else label,
+            "decision": decision, "notes": notes}
 
 
 def labels_for_reviewer(state: AppState, reviewer: str) -> dict[str, dict[str, str]]:
     path = reviewer_file(state, reviewer)
-    return read_reviewer_rows(path)
+    notes = read_notes(state.output_dir).get(reviewer_slug(reviewer), {})
+    return {sample_id: display_review(state, row, notes.get(sample_id, ""))
+            for sample_id, row in read_reviewer_rows(path).items()}
 
 
 def reviews_for_sample(state: AppState, sample_id: str, current_reviewer: str = "") -> list[dict[str, str]]:
     current_slug = reviewer_slug(current_reviewer) if current_reviewer.strip() else ""
     rows: list[dict[str, str]] = []
+    notes = read_notes(state.output_dir)
     for path in sorted(state.output_dir.glob("reviewer_*.csv")):
-        reviewer_from_file = path.stem.removeprefix("reviewer_")
+        reviewer_from_file = without_prefix(path.stem, "reviewer_")
         if current_slug and reviewer_from_file == current_slug:
             continue
         reviewer_rows = read_reviewer_rows(path)
         row = reviewer_rows.get(sample_id)
         if not row:
             continue
-        item = {
-            "reviewer": row.get("reviewer") or reviewer_from_file,
-            "reviewed_label": row.get("reviewed_label", ""),
-            "decision": row.get("decision", ""),
-            "notes": row.get("notes", ""),
-            "timestamp_utc": row.get("timestamp_utc", ""),
-        }
+        item = {"reviewer": reviewer_from_file,
+                **display_review(state, row, notes.get(reviewer_from_file, {}).get(sample_id, ""))}
         rows.append(item)
     return rows
 

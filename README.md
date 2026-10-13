@@ -6,7 +6,7 @@ Keep / Switch / Discard decisions, and optional comparison with other reviewers.
 
 ## Quick start
 
-Requires Python 3.10 or later and a browser. No third-party packages are needed.
+Requires Python 3.8 or later and a browser. No third-party packages are needed.
 From the project directory:
 
 ```bash
@@ -97,9 +97,8 @@ interpreter to run the dashboard. The dashboard reports this problem directly
 instead of retrying it as a network timeout.
 
 Reviews are saved to `reviews/atlas/` in this mode, including when connecting
-from a CSV session. Unlabelled samples have an empty `original_label`;
-new labels use `decision=label`. Discard leaves `reviewed_label` empty.
-The `source_csv` field records the atlas URL when no input CSV exists.
+from a CSV session. New labels are saved as `0` or `1`; discarded samples use
+`discard`.
 Reopening a track reloads the selected reviewer's saved decisions.
 The dataset is shared by clients connected to the same local server;
 use one browser session per server.
@@ -121,18 +120,21 @@ overpass time and satellite, including names with or without `UTC`.
 Only tracks referenced in the CSV are queried; each directory listing is
 fetched once at startup. The browser loads matching images directly from the
 public site as samples are displayed. An internet connection is required.
-Images are not copied into the project; review CSVs remain local and record
-the image URLs. Missing directories are reported as warnings; connection
+Images are not copied into the project; review CSVs remain local and do not
+record image URLs. Missing directories are reported as warnings; connection
 failures stop startup with the failing URL so they are not mistaken for
 missing images. Restart the dashboard to refresh the directory listings.
 
 ## Review files
 
-`reviewer_<name>.csv` stores each reviewer's latest decision for each sample.
-`review_events.csv` records the history of saved decisions.
-Keep confirms the label, Switch inverts it, and Discard records
-`decision=discard`. Discard does not delete images or change the input CSV:
-dataset export code must exclude samples with that decision.
+`reviewer_<name>.csv` stores each reviewer's latest decision with exactly two
+columns: `sample_id,label`. Labels are `0`, `1`, or `discard`.
+`review_events.csv` records the history with `reviewer,sample_id,label`.
+Optional notes are stored separately in `reviewer_notes.json`.
+Existing review files are migrated automatically when the dashboard loads.
+Keep confirms the label, Switch inverts it, and Discard does not delete images
+or change the input CSV: dataset export code must exclude samples labelled
+`discard`.
 
 Show other reviewers reads `reviewer_*.csv` from the same output directory.
 To resume existing reviews, copy those files into your chosen `--output-dir`

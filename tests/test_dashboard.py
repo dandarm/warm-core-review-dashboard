@@ -111,7 +111,6 @@ class StandaloneTests(unittest.TestCase):
                 ))
                 self.assertEqual(result["decision"], "label")
                 row = dashboard.labels_for_reviewer(state, "Test")[sample["sample_id"]]
-                self.assertEqual(row["original_label"], "")
                 self.assertEqual(row["reviewed_label"], str(label))
             dashboard.save_review(state, dict(reviewer="Test", sample_id=sample["sample_id"], action="discard"))
             row = dashboard.labels_for_reviewer(state, "Test")[sample["sample_id"]]
@@ -166,8 +165,21 @@ class StandaloneTests(unittest.TestCase):
                 self.assertEqual(result['decision'], expected)
             rows = dashboard.labels_for_reviewer(state, 'Test')
             self.assertEqual(rows[sample['sample_id']]['decision'], 'discard')
+            dashboard.save_review(state, {
+                'reviewer': 'Test', 'sample_id': sample['sample_id'],
+                'reviewed_label': sample['label'], 'notes': 'unclear',
+            })
+            self.assertEqual(dashboard.labels_for_reviewer(state, 'Test')[sample['sample_id']]['notes'], 'unclear')
+            self.assertEqual(dashboard.reviews_for_sample(state, sample['sample_id'])[0]['notes'], 'unclear')
+            with (state.output_dir / 'reviewer_Test.csv').open(newline='') as f:
+                reader = csv.DictReader(f)
+                self.assertEqual(reader.fieldnames, ['sample_id', 'label'])
+                self.assertEqual(list(reader)[0]['label'], str(sample['label']))
             with (state.output_dir / 'review_events.csv').open(newline='') as f:
-                self.assertEqual(len(list(csv.DictReader(f))), 3)
+                reader = csv.DictReader(f)
+                self.assertEqual(reader.fieldnames, ['reviewer', 'sample_id', 'label'])
+                self.assertEqual([row['label'] for row in reader], [str(sample['label']),
+                                 str(1 - sample['label']), 'discard', str(sample['label'])])
 
             dashboard.DashboardHandler.state = state
             server = dashboard.ThreadingHTTPServer(
@@ -191,6 +203,42 @@ class StandaloneTests(unittest.TestCase):
                 server.shutdown()
                 thread.join()
                 server.server_close()
+
+    def test_legacy_review_migration_preserves_labels_and_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / 'reviews'
+            output_dir.mkdir()
+            sample_id = 'Track0001/WP2300_Output_01-Jan-2000_0100_NPP.npz'
+            fields = ['timestamp_utc', 'reviewer', 'sample_id', 'original_label',
+                      'reviewed_label', 'decision', 'notes', 'unlabelled', 'source_csv', 'image_paths']
+            rows = [dict(reviewer='Leo', sample_id=sample_id, reviewed_label='1',
+                         decision='switch', notes='inspect', image_paths='https://example.org/image.jpg'),
+                    dict(reviewer='Leo', sample_id='other', reviewed_label='0',
+                         decision='discard', image_paths='https://example.org/other.jpg')]
+            for name in ('reviewer_Leo.csv', 'review_events.csv'):
+                with (output_dir / name).open('w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+            dashboard.migrate_reviews(output_dir)
+            dashboard.migrate_reviews(output_dir)
+            with (output_dir / 'reviewer_Leo.csv').open(newline='') as f:
+                reader = csv.DictReader(f)
+                self.assertEqual(reader.fieldnames, ['sample_id', 'label'])
+                self.assertEqual({row['sample_id']: row['label'] for row in reader},
+                                 {sample_id: '1', 'other': 'discard'})
+            with (output_dir / 'review_events.csv').open(newline='') as f:
+                reader = csv.DictReader(f)
+                self.assertEqual(reader.fieldnames, ['reviewer', 'sample_id', 'label'])
+                self.assertEqual([row['label'] for row in reader], ['1', 'discard'])
+            self.assertEqual(json.loads((output_dir / 'reviewer_notes.json').read_text()),
+                             {'Leo': {sample_id: 'inspect'}})
+            state = dashboard.AppState(root, root / 'none.csv', root, output_dir)
+            state.samples = [dict(sample_id=sample_id, label=0)]
+            self.assertEqual(dashboard.labels_for_reviewer(state, 'Leo')[sample_id],
+                             {'reviewed_label': '1', 'decision': 'switch', 'notes': 'inspect'})
+            self.assertEqual(dashboard.reviews_for_sample(state, sample_id)[0]['notes'], 'inspect')
 
 
 if __name__ == '__main__':
