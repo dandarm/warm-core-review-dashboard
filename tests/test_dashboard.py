@@ -40,6 +40,24 @@ class StandaloneTests(unittest.TestCase):
             with self.assertRaises(dashboard.urllib.error.HTTPError):
                 dashboard.read_atlas_index("https://example.org/")
             self.assertEqual(fetch.call_count, 1)
+        with patch.object(dashboard.urllib.request, "urlopen", side_effect=dashboard.urllib.error.URLError("unknown url type: https")) as fetch:
+            with self.assertRaisesRegex(RuntimeError, "cannot open HTTPS"):
+                dashboard.read_atlas_index("https://example.org/", attempts=1)
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_atlas_failure_stops_after_one_request_and_reports_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
+            tracks = [f"track{i:08d}" for i in range(3)]
+            with patch.object(dashboard, "atlas_tracks", return_value=tracks), patch.object(
+                dashboard, "fetch_atlas_track", side_effect=TimeoutError("handshake timed out")
+            ) as fetch:
+                dashboard.load_atlas_batch(state)
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(state.atlas_cursor, 0)
+            self.assertEqual(state.atlas_progress["current_track"], tracks[0])
+            self.assertEqual(state.atlas_progress["status"], "error")
 
     def test_retry_only_fetches_failed_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:

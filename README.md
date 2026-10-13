@@ -64,10 +64,10 @@ without matching images. Arbitrary image filenames are not supported.
 python3 scripts/visual_review_dashboard.py --atlas
 ```
 
-Press **Connect to atlas** to load the first block of track indexes. If the
-first block contains no images, loading continues until the first samples are
-found. Review them immediately, then press **Continue loading** to fetch the
-next 100 tracks. A counter shows how many tracks have been processed. Samples
+Press **Connect to atlas** to load the first 25 track indexes. Review any
+samples found, then press **Continue loading** to fetch the next 25 tracks.
+Early blocks may contain no samples; continue until the first images appear.
+A counter shows how many tracks have been processed. Samples
 are grouped by
 date, time and satellite, with no initial label. Confirm your reviewer name,
 then assign **Negative** (0), **Warm core** (1), or **Discard**.
@@ -83,7 +83,21 @@ Missing image directories are skipped. A failed request stops the current
 batch but leaves previously loaded samples available. Press **Continue
 loading** to retry the failed track and continue. The server remembers its
 position and successful track indexes until it is restarted. Each request
-has a 60-second timeout and up to three attempts with increasing delays.
+has a 15-second timeout and is attempted once. If the site is unavailable,
+wait before pressing **Continue loading**; repeated immediate retries can
+prolong a temporary block. The dashboard cannot label samples until their
+images are reachable from the browser.
+
+On Windows, `unknown url type: https` normally means the selected Python
+installation lacks working SSL support. Check it with:
+
+```powershell
+py -c "import ssl; print(ssl.OPENSSL_VERSION)"
+```
+
+If that fails, install a complete Python build with SSL support and use that
+interpreter to run the dashboard. The dashboard reports this problem directly
+instead of retrying it as a network timeout.
 
 Reviews are saved to `reviews/atlas/` in this mode, including when connecting
 from a CSV session. Unlabelled samples have an empty `original_label`;

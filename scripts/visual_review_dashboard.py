@@ -36,7 +36,8 @@ DEFAULT_CSV = Path("examples/samples.csv")
 DEFAULT_DATA_ROOT = Path("examples/images")
 DEFAULT_OUTPUT_DIR = Path("reviews/demo")
 ATLAS_URL = "https://data-cersat.ifremer.fr/data/storms/medicanes/storm-atlas/climatology/"
-ATLAS_BATCH_SIZE = 100
+ATLAS_BATCH_SIZE = 25
+ATLAS_REQUEST_TIMEOUT = 15
 
 
 @dataclass
@@ -188,25 +189,45 @@ class TrackLinks(HTMLParser):
             self.tracks.add(href.rstrip("/"))
 
 
-def read_atlas_index(url):
-    for attempt in range(3):
+def read_atlas_index(url, *, attempts=3, timeout=60):
+    if url.startswith("https:") and not hasattr(urllib.request, "HTTPSHandler"):
+        raise RuntimeError(
+            "This Python installation cannot open HTTPS URLs. On Windows, run "
+            "py -c \"import ssl; print(ssl.OPENSSL_VERSION)\". If that fails, "
+            "install a complete Python build with SSL support."
+        )
+    for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(url, timeout=60) as response:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
                 return response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             if exc.code not in (408, 429, 500, 502, 503, 504):
                 raise
-            if attempt == 2:
+            if attempt == attempts - 1:
                 raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            if attempt == 2:
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            if "unknown url type: https" in str(exc):
+                raise RuntimeError(
+                    "This Python installation cannot open HTTPS URLs. On Windows, run "
+                    "py -c \"import ssl; print(ssl.OPENSSL_VERSION)\". If that fails, "
+                    "install a complete Python build with SSL support."
+                ) from exc
+            if attempt == attempts - 1:
                 raise
+        except ValueError as exc:
+            if "unknown url type: https" in str(exc):
+                raise RuntimeError(
+                    "This Python installation cannot open HTTPS URLs. On Windows, run "
+                    "py -c \"import ssl; print(ssl.OPENSSL_VERSION)\". If that fails, "
+                    "install a complete Python build with SSL support."
+                ) from exc
+            raise
         time.sleep(2 ** (attempt + 1))
 
 
 def atlas_tracks():
     parser = TrackLinks()
-    parser.feed(read_atlas_index(ATLAS_URL))
+    parser.feed(read_atlas_index(ATLAS_URL, attempts=1, timeout=ATLAS_REQUEST_TIMEOUT))
     return sorted(parser.tracks)
 
 
@@ -216,7 +237,7 @@ def fetch_atlas_track(track):
     directory = ATLAS_URL + track + "/MEDICANES-WC-DC/Images/"
     try:
         parser = ImageLinks(directory)
-        parser.feed(read_atlas_index(directory))
+        parser.feed(read_atlas_index(directory, attempts=1, timeout=ATLAS_REQUEST_TIMEOUT))
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             raise
@@ -263,8 +284,10 @@ def load_atlas_batch(state):
         total = len(state.atlas_tracks)
         end = min(state.atlas_cursor + ATLAS_BATCH_SIZE, total)
         state.atlas_progress = {"status": "loading", "done": state.atlas_cursor, "total": total}
-        while state.atlas_cursor < end or (not state.samples and state.atlas_cursor < total):
+        while state.atlas_cursor < end:
             track = state.atlas_tracks[state.atlas_cursor]
+            state.atlas_progress = {"status": "loading", "done": state.atlas_cursor,
+                                    "total": total, "current_track": track}
             try:
                 samples = state.atlas_cache.get(track)
                 if samples is None:
@@ -1285,6 +1308,7 @@ async function connectAtlas() {
       updateAtlasButtons(progress);
       if (progress.status !== "loading") break;
       setStatus("Loading atlas: " + progress.done + " / " + progress.total + " tracks" +
+        (progress.current_track ? " · " + progress.current_track : "") +
         ". Samples already loaded remain available.");
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
