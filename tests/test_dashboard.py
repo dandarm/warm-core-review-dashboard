@@ -52,13 +52,13 @@ class StandaloneTests(unittest.TestCase):
             tracks = ["track00000001", "track00000002"]
             with patch.object(dashboard, "atlas_tracks", return_value=tracks):
                 with patch.object(dashboard, "fetch_atlas_track", side_effect=fetch):
-                    dashboard.load_full_atlas(state)
+                    dashboard.load_atlas_batch(state)
                 self.assertEqual(state.atlas_progress["status"], "error")
-                self.assertEqual(state.samples, [])
+                self.assertEqual([s["sample_id"] for s in state.samples], [tracks[0]])
                 with patch.object(dashboard, "fetch_atlas_track", return_value=[
                     dict(sample_id=tracks[1], label=None, index=0)
                 ]) as retry:
-                    dashboard.load_full_atlas(state)
+                    dashboard.load_atlas_batch(state)
                 retry.assert_called_once_with(tracks[1])
                 self.assertEqual(state.atlas_progress["status"], "ready")
                 self.assertEqual([s["sample_id"] for s in state.samples], tracks)
@@ -70,15 +70,34 @@ class StandaloneTests(unittest.TestCase):
             def fetch(track):
                 return [dict(sample_id=track, label=None, index=0)]
             with patch.object(dashboard, "atlas_tracks", return_value=["track00000001", "track00000002"]), patch.object(dashboard, "fetch_atlas_track", side_effect=fetch):
-                dashboard.load_full_atlas(state)
+                dashboard.load_atlas_batch(state)
             self.assertEqual([s["sample_id"] for s in state.samples], ["track00000001", "track00000002"])
             self.assertEqual([s["index"] for s in state.samples], [0, 1])
             self.assertEqual(state.atlas_progress["status"], "ready")
             previous = state.samples
             with patch.object(dashboard, "atlas_tracks", return_value=["track00000003"]), patch.object(dashboard, "fetch_atlas_track", side_effect=TimeoutError("offline")):
-                dashboard.load_full_atlas(state)
-            self.assertEqual(state.atlas_progress["status"], "error")
+                dashboard.load_atlas_batch(state)
+            self.assertEqual(state.atlas_progress["status"], "ready")
             self.assertIs(state.samples, previous)
+
+    def test_pauses_after_batch_and_continues_in_track_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
+            tracks = [f"track{i:08d}" for i in range(3)]
+            def fetch(track):
+                return [dict(sample_id=track, label=None, index=0)]
+            with patch.object(dashboard, "ATLAS_BATCH_SIZE", 2), patch.object(dashboard, "atlas_tracks", return_value=tracks) as listing, patch.object(dashboard, "fetch_atlas_track", side_effect=fetch) as getter, patch.object(dashboard.time, "sleep"):
+                dashboard.load_atlas_batch(state)
+                self.assertEqual(state.atlas_progress, {"status": "paused", "done": 2, "total": 3})
+                self.assertEqual([s["sample_id"] for s in state.samples], tracks[:2])
+                self.assertTrue(state.atlas_mode)
+                dashboard.load_atlas_batch(state)
+                self.assertEqual(state.atlas_progress, {"status": "ready", "done": 3, "total": 3})
+                self.assertEqual([s["sample_id"] for s in state.samples], tracks)
+                self.assertEqual([s["index"] for s in state.samples], [0, 1, 2])
+                listing.assert_called_once()
+                self.assertEqual(getter.call_count, 3)
 
     def test_atlas_discovery_and_unlabelled_decisions(self):
         listing = b'<a href="TBanomaly_30-Dec-1999_0630_NOAA15.jpg">A</a><a href="CTH_30-Dec-1999_0630UTC_NOAA15.jpg">B</a>'

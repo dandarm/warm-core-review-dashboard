@@ -64,8 +64,11 @@ without matching images. Arbitrary image filenames are not supported.
 python3 scripts/visual_review_dashboard.py --atlas
 ```
 
-Press **Connect to atlas** to load every track's image index. A progress
-counter shows the initial loading status. Samples are grouped by
+Press **Connect to atlas** to load the first block of track indexes. If the
+first block contains no images, loading continues until the first samples are
+found. Review them immediately, then press **Continue loading** to fetch the
+next 100 tracks. A counter shows how many tracks have been processed. Samples
+are grouped by
 date, time and satellite, with no initial label. Confirm your reviewer name,
 then assign **Negative** (0), **Warm core** (1), or **Discard**.
 The previous/next buttons navigate one continuous sequence, automatically
@@ -74,21 +77,13 @@ The sidebar uses a virtualized list: its scrollbar spans the full dataset,
 while only visible rows and a small buffer are rendered. Previous/next
 navigation keeps the selected row visible. Images scroll independently,
 leaving the sample title and review controls in place.
-Only image listings are loaded upfront; images are fetched as displayed.
-Missing image directories are skipped. Other connection failures are
-reported and can be retried; incomplete scans do not replace the dataset.
-
-Atlas loading uses two parallel requests by default. Each index request has
-a 60-second timeout and up to three attempts with increasing delays.
-Successful track indexes remain cached for the lifetime of the server.
-If a scan fails, press **Connect to atlas** again to retry only missing tracks.
-Restarting the server clears this in-memory cache.
-
-For slow networks or SSL handshake timeouts, use one connection at a time:
-
-```bash
-python3 scripts/visual_review_dashboard.py --atlas --atlas-workers 1
-```
+Each batch uses one request at a time, with a short pause between tracks.
+Only image listings are requested; the browser fetches images as displayed.
+Missing image directories are skipped. A failed request stops the current
+batch but leaves previously loaded samples available. Press **Continue
+loading** to retry the failed track and continue. The server remembers its
+position and successful track indexes until it is restarted. Each request
+has a 60-second timeout and up to three attempts with increasing delays.
 
 Reviews are saved to `reviews/atlas/` in this mode, including when connecting
 from a CSV session. Unlabelled samples have an empty `original_label`;

@@ -19,7 +19,6 @@ import re
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -37,6 +36,7 @@ DEFAULT_CSV = Path("examples/samples.csv")
 DEFAULT_DATA_ROOT = Path("examples/images")
 DEFAULT_OUTPUT_DIR = Path("reviews/demo")
 ATLAS_URL = "https://data-cersat.ifremer.fr/data/storms/medicanes/storm-atlas/climatology/"
+ATLAS_BATCH_SIZE = 100
 
 
 @dataclass
@@ -51,8 +51,9 @@ class AppState:
     atlas_mode: bool = False
     atlas_progress: dict = field(default_factory=lambda: {"status": "idle", "done": 0, "total": 0})
     atlas_lock: Any = field(default_factory=threading.Lock)
-    atlas_workers: int = 2
     atlas_cache: dict = field(default_factory=dict)
+    atlas_tracks: list[str] = field(default_factory=list)
+    atlas_cursor: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765, help="HTTP port.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the browser automatically.")
     parser.add_argument("--atlas", action="store_true", help="Start with no CSV; connect to the public atlas from the dashboard.")
-    parser.add_argument("--atlas-workers", type=int, choices=range(1, 7), default=2,
-                        help="Parallel atlas requests (1-6, default: 2). Use 1 on slow connections.")
+    parser.add_argument("--atlas-workers", type=int, choices=range(1, 7), default=1,
+                        help="Compatibility option; atlas batches always load sequentially.")
     parser.add_argument(
         "--remote-base-url", default="",
         help="Public atlas URL; uses trackNNNNNNNN/MEDICANES-WC-DC/Images/ instead of local images.",
@@ -251,35 +252,38 @@ def load_atlas_track(state, track):
     set_atlas_samples(state, fetch_atlas_track(track))
 
 
-def load_full_atlas(state):
+def load_atlas_batch(state):
     try:
-        tracks = atlas_tracks()
-        if not tracks:
-            raise ValueError("No tracks found in the atlas.")
-        results = {track: state.atlas_cache[track] for track in tracks if track in state.atlas_cache}
-        errors = {}
-        state.atlas_progress = {"status": "loading", "done": len(results), "total": len(tracks), "failed": 0}
-        with ThreadPoolExecutor(max_workers=state.atlas_workers) as executor:
-            pending = {executor.submit(fetch_atlas_track, track): track for track in tracks if track not in results}
-            for future in as_completed(pending):
-                track = pending[future]
-                try:
-                    results[track] = future.result()
-                    state.atlas_cache[track] = results[track]
-                except Exception as exc:
-                    errors[track] = str(exc)
-                state.atlas_progress = {"status": "loading", "done": len(results) + len(errors),
-                                        "total": len(tracks), "failed": len(errors)}
-        if errors:
-            track = next(iter(errors))
-            raise RuntimeError(
-                f"{len(errors)} tracks could not be loaded. First failure: {track}: {errors[track]}. "
-                f"{len(results)} tracks cached. Press Connect to atlas to retry only missing tracks."
-            )
-        set_atlas_samples(state, [sample for track in tracks for sample in results[track]])
-        state.atlas_progress = {"status": "ready", "done": len(tracks), "total": len(tracks)}
+        if not state.atlas_tracks:
+            state.atlas_tracks = atlas_tracks()
+            if not state.atlas_tracks:
+                raise ValueError("No tracks found in the atlas.")
+        if state.atlas_cursor == 0:
+            set_atlas_samples(state, [])
+        total = len(state.atlas_tracks)
+        end = min(state.atlas_cursor + ATLAS_BATCH_SIZE, total)
+        state.atlas_progress = {"status": "loading", "done": state.atlas_cursor, "total": total}
+        while state.atlas_cursor < end or (not state.samples and state.atlas_cursor < total):
+            track = state.atlas_tracks[state.atlas_cursor]
+            try:
+                samples = state.atlas_cache.get(track)
+                if samples is None:
+                    samples = fetch_atlas_track(track)
+                    state.atlas_cache[track] = samples
+            except Exception as exc:
+                raise RuntimeError(f"Could not load {track}: {exc}") from exc
+            # Publish a complete track at a time so navigation works during the scan.
+            for sample in samples:
+                sample["index"] = len(state.samples)
+                state.samples.append(sample)
+            state.atlas_cursor += 1
+            state.atlas_progress = {"status": "loading", "done": state.atlas_cursor, "total": total}
+            time.sleep(0.15)
+        state.atlas_progress = {"status": "ready" if state.atlas_cursor == total else "paused",
+                                "done": state.atlas_cursor, "total": total}
     except Exception as exc:
-        state.atlas_progress = {**state.atlas_progress, "status": "error", "error": str(exc)}
+        state.atlas_progress = {**state.atlas_progress, "status": "error", "error": str(exc),
+                                "done": state.atlas_cursor}
 
 
 def map_remote_images(base_url: str, sample_id: str, cache: dict[str, list[str]]) -> list[str]:
@@ -789,6 +793,7 @@ HTML_PAGE = r"""<!doctype html>
       <div>
         <h1>Warm Core Visual Review</h1>
         <button id="connectAtlas">Connect to atlas</button>
+        <button id="continueAtlas" hidden>Continue loading</button>
         <div class="sub" id="source"></div>
       </div>
       <div class="reviewer">
@@ -1128,6 +1133,7 @@ async function confirmReviewer() {
 
 function maybeShowCompletionMessage() {
   if (state.completionAlertShown || !state.samples.length) return;
+  if (state.config.atlas_mode && !state.config.atlas_complete) return;
   const reviewedCount = state.samples.filter(sample => state.reviews[sample.sample_id]).length;
   if (reviewedCount !== state.samples.length) return;
   state.completionAlertShown = true;
@@ -1251,41 +1257,55 @@ async function init() {
 
   state.reviewerConfirmed = false;
   document.getElementById("connectAtlas").addEventListener("click", connectAtlas);
+  document.getElementById("continueAtlas").addEventListener("click", connectAtlas);
   document.querySelector(".tabs").hidden = !!state.config.atlas_mode;
+  const progress = await fetchJson("/api/atlas/status");
+  updateAtlasButtons(progress);
   setStatus("Enter a reviewer name and press OK to start.");
   render();
 }
 
+function updateAtlasButtons(progress) {
+  document.getElementById("connectAtlas").hidden = progress.total > 0;
+  document.getElementById("continueAtlas").hidden = !progress.total || progress.status === "ready";
+  document.getElementById("continueAtlas").disabled = progress.status === "loading";
+}
+
 async function connectAtlas() {
-  const button = document.getElementById("connectAtlas");
+  const button = state.config.atlas_mode
+    ? document.getElementById("continueAtlas") : document.getElementById("connectAtlas");
   button.disabled = true;
-  state.loading = true;
+  state.loading = !state.config.atlas_mode;
   updateControls();
   setStatus("Connecting to atlas...");
   try {
     await fetchJson("/api/atlas/connect", {method: "POST"});
     while (true) {
       const progress = await fetchJson("/api/atlas/status");
-      if (progress.status === "error") throw new Error(progress.error);
-      if (progress.status === "ready") break;
+      updateAtlasButtons(progress);
+      if (progress.status !== "loading") break;
       setStatus("Loading atlas: " + progress.done + " / " + progress.total + " tracks" +
-        (progress.failed ? " · " + progress.failed + " failed" : ""));
+        ". Samples already loaded remain available.");
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
+    const progress = await fetchJson("/api/atlas/status");
     const payload = await fetchJson("/api/samples");
+    const selectedId = currentSample()?.sample_id;
     state.samples = payload.samples;
     state.config = payload.config;
-    state.index = 0;
-    state.reviews = {};
-    state.completionAlertShown = false;
+    const selectedIndex = state.samples.findIndex(sample => sample.sample_id === selectedId);
+    state.index = selectedIndex >= 0 ? selectedIndex : 0;
     document.querySelector(".tabs").hidden = true;
     els.source.textContent = "Atlas · " + state.samples.length + " samples";
     if (state.reviewerConfirmed) await loadReviews();
     render();
-    setStatus(state.samples.length ? "Atlas loaded." : "No matching atlas images.");
+    if (progress.status === "error") setStatus(progress.error + " Press Continue loading to retry.", "error");
+    else setStatus(progress.status === "ready" ? "Atlas loaded." :
+      progress.done + " / " + progress.total + " tracks loaded. Press Continue loading for more.");
     refreshOtherReviewsIfVisible();
   } catch (error) { setStatus(error.message, "error"); }
-  finally { button.disabled = false; state.loading = false; updateControls(); }
+  finally { button.disabled = false; state.loading = false; updateControls();
+    updateAtlasButtons(await fetchJson("/api/atlas/status")); }
 }
 init().catch(error => setStatus(error.message, "error"));
 </script>
@@ -1343,9 +1363,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/atlas/connect":
                 with self.state.atlas_lock:
-                    if self.state.atlas_progress["status"] not in ("loading", "ready"):
-                        self.state.atlas_progress = {"status": "loading", "done": 0, "total": 0}
-                        threading.Thread(target=load_full_atlas, args=(self.state,), daemon=True).start()
+                    if self.state.atlas_progress["status"] != "loading" and (
+                        not self.state.atlas_tracks or self.state.atlas_cursor < len(self.state.atlas_tracks)
+                    ):
+                        self.state.atlas_progress = {**self.state.atlas_progress, "status": "loading"}
+                        threading.Thread(target=load_atlas_batch, args=(self.state,), daemon=True).start()
                 self.send_json({"ok": True})
                 return
             if parsed.path != "/api/review":
@@ -1371,6 +1393,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "missing_images": state.missing_images,
                     "remote_base_url": state.remote_base_url,
                     "atlas_mode": state.atlas_mode,
+                    "atlas_complete": bool(state.atlas_tracks) and state.atlas_cursor == len(state.atlas_tracks),
                 },
             }
         )
@@ -1434,7 +1457,6 @@ def main() -> int:
         remote_base_url=args.remote_base_url,
     )
     state.atlas_mode = args.atlas
-    state.atlas_workers = args.atlas_workers
     if not args.atlas:
         load_samples(state)
 
