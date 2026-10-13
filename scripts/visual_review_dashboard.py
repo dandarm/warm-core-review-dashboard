@@ -36,7 +36,6 @@ DEFAULT_CSV = Path("examples/samples.csv")
 DEFAULT_DATA_ROOT = Path("examples/images")
 DEFAULT_OUTPUT_DIR = Path("reviews/demo")
 ATLAS_URL = "https://data-cersat.ifremer.fr/data/storms/medicanes/storm-atlas/climatology/"
-ATLAS_BATCH_SIZE = 25
 ATLAS_REQUEST_TIMEOUT = 15
 
 
@@ -50,11 +49,10 @@ class AppState:
     missing_images: list[str] = field(default_factory=list)
     remote_base_url: str = ""
     atlas_mode: bool = False
-    atlas_progress: dict = field(default_factory=lambda: {"status": "idle", "done": 0, "total": 0})
     atlas_lock: Any = field(default_factory=threading.Lock)
     atlas_cache: dict = field(default_factory=dict)
     atlas_tracks: list[str] = field(default_factory=list)
-    atlas_cursor: int = 0
+    atlas_track: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -270,43 +268,24 @@ def set_atlas_samples(state, samples):
 
 
 def load_atlas_track(state, track):
-    set_atlas_samples(state, fetch_atlas_track(track))
+    if track not in state.atlas_tracks:
+        raise ValueError(f"Unknown atlas track: {track}")
+    if track not in state.atlas_cache:
+        state.atlas_cache[track] = fetch_atlas_track(track)
+    set_atlas_samples(state, state.atlas_cache[track])
+    state.atlas_track = track
 
 
-def load_atlas_batch(state):
-    try:
-        if not state.atlas_tracks:
-            state.atlas_tracks = atlas_tracks()
-            if not state.atlas_tracks:
-                raise ValueError("No tracks found in the atlas.")
-        if state.atlas_cursor == 0:
-            set_atlas_samples(state, [])
-        total = len(state.atlas_tracks)
-        end = min(state.atlas_cursor + ATLAS_BATCH_SIZE, total)
-        state.atlas_progress = {"status": "loading", "done": state.atlas_cursor, "total": total}
-        while state.atlas_cursor < end:
-            track = state.atlas_tracks[state.atlas_cursor]
-            state.atlas_progress = {"status": "loading", "done": state.atlas_cursor,
-                                    "total": total, "current_track": track}
-            try:
-                samples = state.atlas_cache.get(track)
-                if samples is None:
-                    samples = fetch_atlas_track(track)
-                    state.atlas_cache[track] = samples
-            except Exception as exc:
-                raise RuntimeError(f"Could not load {track}: {exc}") from exc
-            # Publish a complete track at a time so navigation works during the scan.
-            for sample in samples:
-                sample["index"] = len(state.samples)
-                state.samples.append(sample)
-            state.atlas_cursor += 1
-            state.atlas_progress = {"status": "loading", "done": state.atlas_cursor, "total": total}
-            time.sleep(0.15)
-        state.atlas_progress = {"status": "ready" if state.atlas_cursor == total else "paused",
-                                "done": state.atlas_cursor, "total": total}
-    except Exception as exc:
-        state.atlas_progress = {**state.atlas_progress, "status": "error", "error": str(exc),
-                                "done": state.atlas_cursor}
+def connect_atlas(state):
+    if not state.atlas_tracks:
+        tracks = atlas_tracks()
+        if not tracks:
+            raise ValueError("No tracks found in the atlas.")
+        state.atlas_tracks = tracks
+    if not state.atlas_mode:
+        set_atlas_samples(state, [])
+    state.atlas_mode = True
+    return state.atlas_tracks
 
 
 def map_remote_images(base_url: str, sample_id: str, cache: dict[str, list[str]]) -> list[str]:
@@ -789,6 +768,7 @@ HTML_PAGE = r"""<!doctype html>
     .sample-list-inner .sample-row { position: absolute; left: 0; }
     .image-grid { flex: 1; min-height: 0; overflow-y: auto; align-content: start; grid-auto-rows: max-content; overscroll-behavior: contain; scrollbar-gutter: stable; }
     .reviewer-panel { flex: none; max-height: 25%; overflow: auto; }
+    #samplePicker { width: min(220px, 100%); min-width: 120px; }
     .sub, .status { overflow-wrap: anywhere; }
     textarea { max-height: 120px; }
     @media (max-width: 980px) {
@@ -816,7 +796,6 @@ HTML_PAGE = r"""<!doctype html>
       <div>
         <h1>Warm Core Visual Review</h1>
         <button id="connectAtlas">Connect to atlas</button>
-        <button id="continueAtlas" hidden>Continue loading</button>
         <div class="sub" id="source"></div>
       </div>
       <div class="reviewer">
@@ -852,7 +831,7 @@ HTML_PAGE = r"""<!doctype html>
       <div style="margin: 12px 0 8px;">
         <textarea id="notes" placeholder="Optional notes"></textarea>
       </div>
-      <div class="sample-list" id="sampleList" aria-label="Samples"></div>
+      <div class="sample-list" id="sampleList" aria-label="Samples or atlas tracks"></div>
     </aside>
     <section class="viewer">
       <div class="sample-head">
@@ -861,6 +840,7 @@ HTML_PAGE = r"""<!doctype html>
           <div class="badges" id="badges"></div>
         </div>
         <div class="nav">
+          <select id="samplePicker" aria-label="Sample in selected track" hidden></select>
           <button id="showOtherReviews">Show other reviewers</button>
           <button id="jumpUnreviewed">Next unreviewed sample</button>
         </div>
@@ -881,6 +861,8 @@ const state = {
   completionAlertShown: false,
   otherReviewsSampleId: "",
   otherReviewsVisible: false,
+  tracks: [],
+  trackIndex: -1,
 };
 
 const els = {
@@ -906,6 +888,7 @@ const els = {
   otherReviewsPanel: document.getElementById("otherReviewsPanel"),
   images: document.getElementById("images"),
   jumpUnreviewed: document.getElementById("jumpUnreviewed"),
+  samplePicker: document.getElementById("samplePicker"),
 };
 
 function setStatus(text, cls = "") {
@@ -1022,25 +1005,28 @@ function refreshOtherReviewsIfVisible() {
 }
 
 function renderList() {
-  const list = currentList();
+  const atlas = !!state.config?.atlas_mode;
+  const list = atlas ? state.tracks : currentList();
   const rowHeight = 40;
   const start = Math.max(0, Math.floor(els.sampleList.scrollTop / rowHeight) - 6);
   const count = Math.ceil(els.sampleList.clientHeight / rowHeight) + 12;
   const inner = document.createElement("div");
   inner.className = "sample-list-inner";
   inner.style.height = (list.length * rowHeight) + "px";
-  list.slice(start, start + count).forEach((sample, offset) => {
+  list.slice(start, start + count).forEach((item, offset) => {
     const i = start + offset;
     const button = document.createElement("button");
-    button.className = "sample-row" + (i === state.index ? " active" : "") + (state.reviews[sample.sample_id] ? " reviewed" : "");
+    const selected = atlas ? i === state.trackIndex : i === state.index;
+    button.className = "sample-row" + (selected ? " active" : "") + (!atlas && state.reviews[item.sample_id] ? " reviewed" : "");
     button.style.top = (i * rowHeight) + "px";
-    button.title = sample.sample_id;
-    button.setAttribute("aria-label", (i + 1) + ": " + sample.sample_id);
-    button.innerHTML = `<i class="dot"></i><span>${escapeHtml(sample.sample_id)}</span><small>${sample.images.length} img</small>`;
+    const name = atlas ? item : item.sample_id;
+    button.title = name;
+    button.setAttribute("aria-label", (i + 1) + ": " + name);
+    const countText = atlas ? (state.config.atlas_track_counts?.[item] ?? "") : item.images.length;
+    button.innerHTML = `<i class="dot"></i><span>${escapeHtml(name)}</span><small>${countText === "" ? "" : countText + (atlas ? " samples" : " img")}</small>`;
     button.addEventListener("click", () => {
-      state.index = i;
-      render();
-      refreshOtherReviewsIfVisible();
+      if (atlas) selectTrack(i);
+      else { state.index = i; render(); refreshOtherReviewsIfVisible(); }
     });
     inner.appendChild(button);
   });
@@ -1048,14 +1034,16 @@ function renderList() {
 }
 
 function revealCurrentSample() {
-  const top = state.index * 40;
+  const selectedIndex = state.config?.atlas_mode ? state.trackIndex : state.index;
+  if (selectedIndex < 0) return;
+  const top = selectedIndex * 40;
   if (top < els.sampleList.scrollTop) els.sampleList.scrollTop = top;
   else if (top + 40 > els.sampleList.scrollTop + els.sampleList.clientHeight)
     els.sampleList.scrollTop = top + 40 - els.sampleList.clientHeight;
 }
 
 function render() {
-  if (!currentList().length) {
+  if (!state.config?.atlas_mode && !currentList().length) {
     const fallbackLabel = Object.keys(state.byLabel).find(label => state.byLabel[label].length > 0);
     if (fallbackLabel !== undefined && Number(fallbackLabel) !== state.label) {
       state.label = Number(fallbackLabel);
@@ -1066,11 +1054,15 @@ function render() {
   updateControls();
   const list = currentList();
   if (!list.length) {
-    els.position.textContent = "0 / 0";
-    els.sampleTitle.textContent = "No samples";
+    els.position.textContent = state.config?.atlas_mode
+      ? `${Math.max(0, state.trackIndex + 1)} / ${state.tracks.length}` : "0 / 0";
+    els.sampleTitle.textContent = state.config?.atlas_mode
+      ? (state.trackIndex < 0 ? "Select a track" : "No images in this track") : "No samples";
     els.badges.innerHTML = "";
     els.images.innerHTML = "";
-    els.sampleList.replaceChildren();
+    els.samplePicker.hidden = true;
+    revealCurrentSample();
+    renderList();
     els.reviewedCount.textContent = "0 reviewed";
     els.meter.style.width = "0%";
     return;
@@ -1083,6 +1075,14 @@ function render() {
   els.tab0.classList.toggle("active", state.label === 0);
   els.tab1.classList.toggle("active", state.label === 1);
   els.position.textContent = `${state.index + 1} / ${list.length}`;
+  if (state.config?.atlas_mode) {
+    els.samplePicker.hidden = false;
+    if (els.samplePicker.options.length !== list.length || els.samplePicker.dataset.track !== state.config.atlas_track) {
+      els.samplePicker.replaceChildren(...list.map((item, i) => new Option(`${i + 1}. ${item.sample_id.split("/").pop()}`, String(i))));
+      els.samplePicker.dataset.track = state.config.atlas_track;
+    }
+    els.samplePicker.value = String(state.index);
+  } else els.samplePicker.hidden = true;
   els.reviewedCount.textContent = `${reviewedInLabel} of ${list.length} reviewed`;
   els.meter.style.width = `${list.length ? (reviewedInLabel / list.length) * 100 : 0}%`;
   els.sampleTitle.textContent = sample.sample_id;
@@ -1156,11 +1156,10 @@ async function confirmReviewer() {
 
 function maybeShowCompletionMessage() {
   if (state.completionAlertShown || !state.samples.length) return;
-  if (state.config.atlas_mode && !state.config.atlas_complete) return;
   const reviewedCount = state.samples.filter(sample => state.reviews[sample.sample_id]).length;
   if (reviewedCount !== state.samples.length) return;
   state.completionAlertShown = true;
-  window.alert(`Review complete: all ${state.samples.length} samples have been reviewed.`);
+  window.alert(`Review complete: all ${state.samples.length} samples${state.config.atlas_mode ? " in " + state.config.atlas_track : ""} have been reviewed.`);
 }
 
 async function save(reviewedLabel, action = "") {
@@ -1210,8 +1209,13 @@ function setLabel(label) {
   refreshOtherReviewsIfVisible();
 }
 
-function next(delta) {
+async function next(delta) {
+  if (state.loading) return;
   const list = currentList();
+  if (state.config.atlas_mode && (state.index + delta < 0 || state.index + delta >= list.length)) {
+    await selectTrack(state.trackIndex + delta, delta < 0);
+    return;
+  }
   state.index = Math.max(0, Math.min(state.index + delta, list.length - 1));
   render();
   refreshOtherReviewsIfVisible();
@@ -1246,7 +1250,9 @@ async function init() {
     0: state.samples.filter(sample => sample.label === 0),
     1: state.samples.filter(sample => sample.label === 1),
   };
-  els.source.textContent = `${payload.config.atlas_mode ? "Atlas" : payload.config.input_csv} · ${state.samples.length} samples`;
+  els.source.textContent = payload.config.atlas_mode
+    ? `Atlas · ${payload.config.atlas_track || "no track selected"}`
+    : `${payload.config.input_csv} · ${state.samples.length} samples`;
 
   document.querySelectorAll(".tabs button").forEach(button => {
     button.addEventListener("click", () => setLabel(Number(button.dataset.label)));
@@ -1265,6 +1271,11 @@ async function init() {
   });
   els.prev.addEventListener("click", () => next(-1));
   els.next.addEventListener("click", () => next(1));
+  els.samplePicker.addEventListener("change", () => {
+    state.index = Number(els.samplePicker.value);
+    render();
+    refreshOtherReviewsIfVisible();
+  });
   els.keep.addEventListener("click", () => save(state.config.atlas_mode ? 0 : currentSample().label));
   els.switch.addEventListener("click", () => save(state.config.atlas_mode ? 1 : currentSample().label === 0 ? 1 : 0));
   els.discard.addEventListener("click", () => save(currentSample().label, "discard"));
@@ -1280,56 +1291,62 @@ async function init() {
 
   state.reviewerConfirmed = false;
   document.getElementById("connectAtlas").addEventListener("click", connectAtlas);
-  document.getElementById("continueAtlas").addEventListener("click", connectAtlas);
   document.querySelector(".tabs").hidden = !!state.config.atlas_mode;
-  const progress = await fetchJson("/api/atlas/status");
-  updateAtlasButtons(progress);
+  state.tracks = (await fetchJson("/api/atlas/tracks")).tracks;
+  state.trackIndex = state.tracks.indexOf(state.config.atlas_track);
+  document.getElementById("connectAtlas").hidden = state.tracks.length > 0;
   setStatus("Enter a reviewer name and press OK to start.");
   render();
 }
 
-function updateAtlasButtons(progress) {
-  document.getElementById("connectAtlas").hidden = progress.total > 0;
-  document.getElementById("continueAtlas").hidden = !progress.total || progress.status === "ready";
-  document.getElementById("continueAtlas").disabled = progress.status === "loading";
-}
-
 async function connectAtlas() {
-  const button = state.config.atlas_mode
-    ? document.getElementById("continueAtlas") : document.getElementById("connectAtlas");
+  const button = document.getElementById("connectAtlas");
   button.disabled = true;
-  state.loading = !state.config.atlas_mode;
+  state.loading = true;
   updateControls();
   setStatus("Connecting to atlas...");
   try {
-    await fetchJson("/api/atlas/connect", {method: "POST"});
-    while (true) {
-      const progress = await fetchJson("/api/atlas/status");
-      updateAtlasButtons(progress);
-      if (progress.status !== "loading") break;
-      setStatus("Loading atlas: " + progress.done + " / " + progress.total + " tracks" +
-        (progress.current_track ? " · " + progress.current_track : "") +
-        ". Samples already loaded remain available.");
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    const progress = await fetchJson("/api/atlas/status");
-    const payload = await fetchJson("/api/samples");
-    const selectedId = currentSample()?.sample_id;
-    state.samples = payload.samples;
-    state.config = payload.config;
-    const selectedIndex = state.samples.findIndex(sample => sample.sample_id === selectedId);
-    state.index = selectedIndex >= 0 ? selectedIndex : 0;
+    const payload = await fetchJson("/api/atlas/connect", {method: "POST"});
+    state.tracks = payload.tracks;
+    const dataset = await fetchJson("/api/samples");
+    state.samples = dataset.samples;
+    state.config = dataset.config;
+    state.index = 0;
+    state.trackIndex = state.tracks.indexOf(state.config.atlas_track);
+    state.completionAlertShown = false;
     document.querySelector(".tabs").hidden = true;
-    els.source.textContent = "Atlas · " + state.samples.length + " samples";
+    button.hidden = true;
+    els.source.textContent = "Atlas · " + state.tracks.length + " tracks";
     if (state.reviewerConfirmed) await loadReviews();
     render();
-    if (progress.status === "error") setStatus(progress.error + " Press Continue loading to retry.", "error");
-    else setStatus(progress.status === "ready" ? "Atlas loaded." :
-      progress.done + " / " + progress.total + " tracks loaded. Press Continue loading for more.");
-    refreshOtherReviewsIfVisible();
+    setStatus("Select a track to load its images.");
   } catch (error) { setStatus(error.message, "error"); }
-  finally { button.disabled = false; state.loading = false; updateControls();
-    updateAtlasButtons(await fetchJson("/api/atlas/status")); }
+  finally { button.disabled = false; state.loading = false; updateControls(); }
+}
+
+async function selectTrack(index, lastSample = false) {
+  if (state.loading || index < 0 || index >= state.tracks.length) return;
+  const track = state.tracks[index];
+  state.loading = true;
+  updateControls();
+  setStatus("Loading " + track + "...");
+  try {
+    const payload = await fetchJson("/api/atlas/track", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({track}),
+    });
+    state.samples = payload.samples;
+    state.config = payload.config;
+    state.trackIndex = index;
+    state.index = lastSample ? Math.max(0, state.samples.length - 1) : 0;
+    els.source.textContent = `Atlas · ${track} · ${state.samples.length} samples`;
+    state.completionAlertShown = false;
+    if (state.reviewerConfirmed) await loadReviews();
+    render();
+    refreshOtherReviewsIfVisible();
+    setStatus(state.samples.length ? track + " loaded." : "No images in " + track + ".");
+  } catch (error) { setStatus(error.message, "error"); }
+  finally { state.loading = false; updateControls(); }
 }
 init().catch(error => setStatus(error.message, "error"));
 </script>
@@ -1363,10 +1380,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         try:
-            if parsed.path == "/api/atlas/status":
-                self.send_json(self.state.atlas_progress)
-            elif parsed.path == "/api/atlas/tracks":
-                self.send_json({"ok": True, "tracks": atlas_tracks()})
+            if parsed.path == "/api/atlas/tracks":
+                self.send_json({"ok": True, "tracks": self.state.atlas_tracks})
             elif parsed.path == "/":
                 self.send_text(HTML_PAGE)
             elif parsed.path == "/api/samples":
@@ -1387,12 +1402,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/atlas/connect":
                 with self.state.atlas_lock:
-                    if self.state.atlas_progress["status"] != "loading" and (
-                        not self.state.atlas_tracks or self.state.atlas_cursor < len(self.state.atlas_tracks)
-                    ):
-                        self.state.atlas_progress = {**self.state.atlas_progress, "status": "loading"}
-                        threading.Thread(target=load_atlas_batch, args=(self.state,), daemon=True).start()
-                self.send_json({"ok": True})
+                    tracks = connect_atlas(self.state)
+                self.send_json({"ok": True, "tracks": tracks})
+                return
+            if parsed.path == "/api/atlas/track":
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                with self.state.atlas_lock:
+                    load_atlas_track(self.state, str(payload.get("track", "")))
+                self.handle_samples()
                 return
             if parsed.path != "/api/review":
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -1417,7 +1435,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "missing_images": state.missing_images,
                     "remote_base_url": state.remote_base_url,
                     "atlas_mode": state.atlas_mode,
-                    "atlas_complete": bool(state.atlas_tracks) and state.atlas_cursor == len(state.atlas_tracks),
+                    "atlas_track": state.atlas_track,
+                    "atlas_track_counts": {track: len(samples) for track, samples in state.atlas_cache.items()},
                 },
             }
         )

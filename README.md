@@ -64,29 +64,26 @@ without matching images. Arbitrary image filenames are not supported.
 python3 scripts/visual_review_dashboard.py --atlas
 ```
 
-Press **Connect to atlas** to load the first 25 track indexes. Review any
-samples found, then press **Continue loading** to fetch the next 25 tracks.
-Early blocks may contain no samples; continue until the first images appear.
-A counter shows how many tracks have been processed. Samples
-are grouped by
-date, time and satellite, with no initial label. Confirm your reviewer name,
-then assign **Negative** (0), **Warm core** (1), or **Discard**.
-The previous/next buttons navigate one continuous sequence, automatically
-crossing track boundaries. Completion refers to the entire loaded atlas.
-The sidebar uses a virtualized list: its scrollbar spans the full dataset,
-while only visible rows and a small buffer are rendered. Previous/next
-navigation keeps the selected row visible. Images scroll independently,
-leaving the sample title and review controls in place.
-Each batch uses one request at a time, with a short pause between tracks.
-Only image listings are requested; the browser fetches images as displayed.
-Missing image directories are skipped. A failed request stops the current
-batch but leaves previously loaded samples available. Press **Continue
-loading** to retry the failed track and continue. The server remembers its
-position and successful track indexes until it is restarted. Each request
-has a 15-second timeout and is attempted once. If the site is unavailable,
-wait before pressing **Continue loading**; repeated immediate retries can
-prolong a temporary block. The dashboard cannot label samples until their
-images are reachable from the browser.
+Press **Connect to atlas** to request only the list of track names. The left
+column displays all tracks without fetching their image directories. Click a
+track to load its samples; the server requests only that track's image index.
+The sample selector above the images jumps within the chosen track. The
+previous/next buttons move between samples and request the adjacent track
+only when crossing a track boundary. Empty tracks show "No images in this
+track"; the arrow can then move to the next or previous track.
+
+Samples are grouped by date, time and satellite, with no initial label.
+Confirm your reviewer name, then assign **Negative** (0), **Warm core** (1),
+or **Discard**. Completion refers to the selected track. The sidebar uses a
+virtualized list so its scrollbar spans the full track list. Images scroll
+independently, leaving the sample title and review controls visible.
+
+Track image indexes are cached in the server for the session, including empty
+tracks, so revisiting a track makes no new site request. A failed request
+leaves the current track visible; select the desired track again after the
+site recovers. Image files are fetched by the browser only when displayed.
+Each index request has a 15-second timeout and is attempted once. Restarting
+the server clears the in-memory cache.
 
 On Windows, `unknown url type: https` normally means the selected Python
 installation lacks working SSL support. Check it with:
@@ -103,7 +100,7 @@ Reviews are saved to `reviews/atlas/` in this mode, including when connecting
 from a CSV session. Unlabelled samples have an empty `original_label`;
 new labels use `decision=label`. Discard leaves `reviewed_label` empty.
 The `source_csv` field records the atlas URL when no input CSV exists.
-Reconnecting reloads the selected reviewer's saved decisions.
+Reopening a track reloads the selected reviewer's saved decisions.
 The dataset is shared by clients connected to the same local server;
 use one browser session per server.
 

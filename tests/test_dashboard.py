@@ -45,83 +45,60 @@ class StandaloneTests(unittest.TestCase):
                 dashboard.read_atlas_index("https://example.org/", attempts=1)
             self.assertEqual(fetch.call_count, 1)
 
-    def test_atlas_failure_stops_after_one_request_and_reports_track(self):
+    def test_atlas_connect_and_load_only_selected_track(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
-            tracks = [f"track{i:08d}" for i in range(3)]
-            with patch.object(dashboard, "atlas_tracks", return_value=tracks), patch.object(
-                dashboard, "fetch_atlas_track", side_effect=TimeoutError("handshake timed out")
+            tracks = ["track00000841", "track00000842", "track00000843"]
+            with patch.object(dashboard, "atlas_tracks", return_value=tracks) as listing, patch.object(
+                dashboard, "fetch_atlas_track", return_value=[
+                    dict(sample_id="Track0842/WP2300_Output_05-Jan-2000_0555_NOAA15.npz",
+                         label=None, index=0, images=["https://example.org/image.jpg"], unlabelled=1)
+                ]
             ) as fetch:
-                dashboard.load_atlas_batch(state)
-            self.assertEqual(fetch.call_count, 1)
-            self.assertEqual(state.atlas_cursor, 0)
-            self.assertEqual(state.atlas_progress["current_track"], tracks[0])
-            self.assertEqual(state.atlas_progress["status"], "error")
-
-    def test_retry_only_fetches_failed_tracks(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
-            def fetch(track):
-                if track == "track00000002":
-                    raise TimeoutError("handshake")
-                return [dict(sample_id=track, label=None, index=0)]
-            tracks = ["track00000001", "track00000002"]
-            with patch.object(dashboard, "atlas_tracks", return_value=tracks):
-                with patch.object(dashboard, "fetch_atlas_track", side_effect=fetch):
-                    dashboard.load_atlas_batch(state)
-                self.assertEqual(state.atlas_progress["status"], "error")
-                self.assertEqual([s["sample_id"] for s in state.samples], [tracks[0]])
-                with patch.object(dashboard, "fetch_atlas_track", return_value=[
-                    dict(sample_id=tracks[1], label=None, index=0)
-                ]) as retry:
-                    dashboard.load_atlas_batch(state)
-                retry.assert_called_once_with(tracks[1])
-                self.assertEqual(state.atlas_progress["status"], "ready")
-                self.assertEqual([s["sample_id"] for s in state.samples], tracks)
-
-    def test_full_atlas_order_and_failure_preserves_samples(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
-            def fetch(track):
-                return [dict(sample_id=track, label=None, index=0)]
-            with patch.object(dashboard, "atlas_tracks", return_value=["track00000001", "track00000002"]), patch.object(dashboard, "fetch_atlas_track", side_effect=fetch):
-                dashboard.load_atlas_batch(state)
-            self.assertEqual([s["sample_id"] for s in state.samples], ["track00000001", "track00000002"])
-            self.assertEqual([s["index"] for s in state.samples], [0, 1])
-            self.assertEqual(state.atlas_progress["status"], "ready")
-            previous = state.samples
-            with patch.object(dashboard, "atlas_tracks", return_value=["track00000003"]), patch.object(dashboard, "fetch_atlas_track", side_effect=TimeoutError("offline")):
-                dashboard.load_atlas_batch(state)
-            self.assertEqual(state.atlas_progress["status"], "ready")
-            self.assertIs(state.samples, previous)
-
-    def test_pauses_after_batch_and_continues_in_track_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
-            tracks = [f"track{i:08d}" for i in range(3)]
-            def fetch(track):
-                return [dict(sample_id=track, label=None, index=0)]
-            with patch.object(dashboard, "ATLAS_BATCH_SIZE", 2), patch.object(dashboard, "atlas_tracks", return_value=tracks) as listing, patch.object(dashboard, "fetch_atlas_track", side_effect=fetch) as getter, patch.object(dashboard.time, "sleep"):
-                dashboard.load_atlas_batch(state)
-                self.assertEqual(state.atlas_progress, {"status": "paused", "done": 2, "total": 3})
-                self.assertEqual([s["sample_id"] for s in state.samples], tracks[:2])
-                self.assertTrue(state.atlas_mode)
-                dashboard.load_atlas_batch(state)
-                self.assertEqual(state.atlas_progress, {"status": "ready", "done": 3, "total": 3})
-                self.assertEqual([s["sample_id"] for s in state.samples], tracks)
-                self.assertEqual([s["index"] for s in state.samples], [0, 1, 2])
+                self.assertEqual(dashboard.connect_atlas(state), tracks)
+                self.assertEqual(state.samples, [])
+                self.assertEqual(state.atlas_tracks, tracks)
+                fetch.assert_not_called()
+                dashboard.load_atlas_track(state, tracks[1])
+                self.assertEqual(state.atlas_track, tracks[1])
+                self.assertEqual(len(state.samples), 1)
+                sample_id = state.samples[0]["sample_id"]
+                dashboard.save_review(state, dict(reviewer="Test", sample_id=sample_id, reviewed_label=1))
+                dashboard.load_atlas_track(state, tracks[0])
+                self.assertEqual(state.samples, state.atlas_cache[tracks[0]])
+                dashboard.load_atlas_track(state, tracks[1])
+                self.assertEqual(fetch.call_count, 2)
+                self.assertEqual(fetch.call_args_list[0].args, (tracks[1],))
+                self.assertEqual(dashboard.labels_for_reviewer(state, "Test")[sample_id]["reviewed_label"], "1")
                 listing.assert_called_once()
-                self.assertEqual(getter.call_count, 3)
+                with self.assertRaisesRegex(ValueError, "Unknown atlas track"):
+                    dashboard.load_atlas_track(state, "track00009999")
+                self.assertEqual(fetch.call_count, 2)
 
+    def test_failed_track_keeps_previous_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = dashboard.AppState(root, root / "none.csv", root, root / "reviews")
+            state.atlas_tracks = ["track00000841", "track00000842"]
+            state.atlas_cache["track00000841"] = [
+                dict(sample_id="Track0841/WP2300_Output_30-Dec-1999_0630_NOAA15.npz",
+                     label=None, index=0, images=[], unlabelled=1)
+            ]
+            dashboard.load_atlas_track(state, "track00000841")
+            previous = state.samples
+            with patch.object(dashboard, "fetch_atlas_track", side_effect=TimeoutError("handshake")):
+                with self.assertRaises(TimeoutError):
+                    dashboard.load_atlas_track(state, "track00000842")
+            self.assertEqual(state.atlas_track, "track00000841")
+            self.assertIs(state.samples, previous)
+            self.assertNotIn("track00000842", state.atlas_cache)
     def test_atlas_discovery_and_unlabelled_decisions(self):
         listing = b'<a href="TBanomaly_30-Dec-1999_0630_NOAA15.jpg">A</a><a href="CTH_30-Dec-1999_0630UTC_NOAA15.jpg">B</a>'
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state = dashboard.AppState(root, root / "absent.csv", root / "absent", root / "reviews")
+            state.atlas_tracks = ["track00000841"]
             with patch.object(dashboard.urllib.request, "urlopen", return_value=BytesIO(listing)):
                 dashboard.load_atlas_track(state, "track00000841")
             self.assertEqual(len(state.samples), 1)
