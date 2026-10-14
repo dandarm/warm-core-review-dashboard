@@ -36,6 +36,7 @@ DEFAULT_DATA_ROOT = Path("examples/images")
 DEFAULT_OUTPUT_DIR = Path("reviews/demo")
 ATLAS_URL = "https://data-cersat.ifremer.fr/data/storms/medicanes/storm-atlas/climatology/"
 ATLAS_REQUEST_TIMEOUT = 15
+ATLAS_FIRST_TRACK = 841
 
 
 @dataclass
@@ -230,7 +231,7 @@ def read_atlas_index(url, *, attempts=3, timeout=60):
 def atlas_tracks():
     parser = TrackLinks()
     parser.feed(read_atlas_index(ATLAS_URL, attempts=1, timeout=ATLAS_REQUEST_TIMEOUT))
-    return sorted(parser.tracks)
+    return sorted(track for track in parser.tracks if int(track[5:]) >= ATLAS_FIRST_TRACK)
 
 
 def fetch_atlas_track(track):

@@ -65,7 +65,7 @@ python3 scripts/visual_review_dashboard.py --atlas
 ```
 
 Press **Connect to atlas** to request only the list of track names. The left
-column displays all tracks without fetching their image directories. Click a
+column displays tracks from ID 841 onward without fetching their image directories. Click a
 track to load its samples; the server requests only that track's image index.
 The sample selector above the images jumps within the chosen track. The
 previous/next buttons move between samples and request the adjacent track

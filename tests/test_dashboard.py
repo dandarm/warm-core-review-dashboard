@@ -24,6 +24,13 @@ spec.loader.exec_module(dashboard)
 
 
 class StandaloneTests(unittest.TestCase):
+    def test_atlas_listing_starts_at_track_841(self):
+        listing = ('<a href="track00000840/">840</a>'
+                   '<a href="track00000842/">842</a>'
+                   '<a href="track00000841/">841</a>')
+        with patch.object(dashboard, 'read_atlas_index', return_value=listing):
+            self.assertEqual(dashboard.atlas_tracks(), ['track00000841', 'track00000842'])
+
     def test_index_retries_timeout_and_not_found_is_not_retried(self):
         with patch.object(dashboard.urllib.request, "urlopen", side_effect=[
             dashboard.urllib.error.URLError(TimeoutError("handshake timed out")),
