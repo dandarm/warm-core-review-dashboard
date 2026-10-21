@@ -56,6 +56,22 @@ Supported extensions are lowercase `.jpg`, `.jpeg`, and `.png`.
 All matching images are displayed. The terminal reports the number of samples
 without matching images. Arbitrary image filenames are not supported.
 
+## Local track folders (no CSV)
+
+Start the dashboard normally, then click **Open local folder** next to
+**Connect to atlas**. Use **Browse** to select a folder on the computer running
+the dashboard, or enter its absolute path if the native picker is unavailable.
+The folder may contain `track00000841/MEDICANES-WC-DC/Images/` or
+`Track0841/Images/` directories. The track list is loaded first; image files
+are read only when you select a track. Image filenames must contain a date,
+four-digit time, and satellite name as described above. Local reviews are saved
+separately under `reviews/local/` for each selected folder.
+
+The `.npz` sample ID used in review CSVs is generated from image names in both
+local and public-atlas modes for compatibility with existing reviews; no NPZ
+file is read or required. The dashboard displays the date, time, and satellite
+instead of that ID.
+
 ## Public atlas images
 
 ### Label directly from the atlas (no CSV)

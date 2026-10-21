@@ -24,6 +24,51 @@ spec.loader.exec_module(dashboard)
 
 
 class StandaloneTests(unittest.TestCase):
+    def test_local_folder_tracks_and_reviews(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / 'downloaded'
+            for track, image_dir in (
+                ('track00000841', folder / 'track00000841' / 'MEDICANES-WC-DC' / 'Images'),
+                ('Track0842', folder / 'Track0842' / 'Images'),
+            ):
+                image_dir.mkdir(parents=True)
+                (image_dir / 'TBanomaly_30-Dec-1999_0630_NOAA15.jpg').write_bytes(b'image')
+            (folder / 'unrelated').mkdir()
+            state = dashboard.AppState(root, root / 'none.csv', root, root / 'reviews')
+            self.assertEqual(dashboard.connect_local_folder(state, str(folder)),
+                             ['track00000841', 'Track0842'])
+            self.assertEqual(state.samples, [])
+            self.assertTrue(state.local_mode)
+            self.assertNotEqual(state.output_dir, root / 'reviews/atlas')
+            dashboard.load_atlas_track(state, 'track00000841')
+            self.assertEqual(len(state.samples), 1)
+            sample = state.samples[0]
+            self.assertEqual(sample['sample_id'], 'Track0841/WP2300_Output_30-Dec-1999_0630_NOAA15.npz')
+            self.assertEqual(sample['images'], [str(folder / 'track00000841' / 'MEDICANES-WC-DC' /
+                                                       'Images' / 'TBanomaly_30-Dec-1999_0630_NOAA15.jpg')])
+            dashboard.save_review(state, {'reviewer': 'Test', 'sample_id': sample['sample_id'],
+                                          'reviewed_label': 1})
+            dashboard.load_atlas_track(state, 'Track0842')
+            self.assertEqual(len(state.samples), 1)
+            self.assertEqual(dashboard.labels_for_reviewer(state, 'Test')[sample['sample_id']]['reviewed_label'], '1')
+            dashboard.DashboardHandler.state = state
+            server = dashboard.ThreadingHTTPServer(('127.0.0.1', 0), dashboard.DashboardHandler)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                with urlopen(f'http://127.0.0.1:{server.server_port}/image?path=' +
+                             quote(state.samples[0]['images'][0])) as response:
+                    self.assertEqual(response.read(), b'image')
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+            with patch.object(dashboard, 'atlas_tracks', return_value=['track00000841']):
+                dashboard.connect_atlas(state)
+            self.assertFalse(state.local_mode)
+            self.assertEqual(state.output_dir, root / 'reviews/atlas')
+
     def test_atlas_listing_starts_at_track_841(self):
         listing = ('<a href="track00000840/">840</a>'
                    '<a href="track00000842/">842</a>'
