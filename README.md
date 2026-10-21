@@ -10,22 +10,18 @@ Requires Python 3.8 or later and a browser. No third-party packages are needed.
 From the project directory:
 
 ```bash
-python3 scripts/visual_review_dashboard.py
+python3 scripts/visual_review_dashboard.py --atlas
 ```
 
-For the current local installation, the complete launch command is:
-
-```bash
-cd /media/fenrir/disk1/danieleda/wc-detection/warm-core-review-dashboard
-python3 scripts/visual_review_dashboard.py
-```
-
-The browser opens http://127.0.0.1:8765 with the bundled examples.
-Enter a reviewer name and press OK to enable decisions.
-Demo reviews are saved to `reviews/demo/`. Stop the server with Ctrl+C.
+The browser opens http://127.0.0.1:8765. Choose **Open local folder** to
+review a folder of track images, or **Connect to atlas** to use the public site.
+Neither option needs an input CSV listing images or labels. Enter a reviewer
+name and press OK to enable decisions. Stop the server with Ctrl+C.
 Add `--no-browser` to skip opening the browser or `--port 8766` to change ports.
 
-## Custom datasets
+## Optional CSV mode
+
+Use a CSV only when you already have a labelled sample selection to review:
 
 ```bash
 python3 scripts/visual_review_dashboard.py /path/to/samples.csv \
@@ -58,7 +54,7 @@ without matching images. Arbitrary image filenames are not supported.
 
 ## Local track folders (no CSV)
 
-Start the dashboard normally, then click **Open local folder** next to
+Start the dashboard as shown in Quick start, then click **Open local folder** next to
 **Connect to atlas**. Use **Browse** to select a folder on the computer running
 the dashboard, or enter its absolute path if the native picker is unavailable.
 The folder may contain `track00000841/MEDICANES-WC-DC/Images/` or
