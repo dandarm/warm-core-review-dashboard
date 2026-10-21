@@ -57,6 +57,8 @@ class AppState:
     atlas_track: str = ""
     local_mode: bool = False
     local_root: Path | None = None
+    flat_mode: bool = False
+    flat_root: Path | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -274,6 +276,17 @@ def local_tracks(root):
                   key=lambda name: (int(name[5:]), name))
 
 
+def natural_name_key(name):
+    parts = re.split(r"(\d+)", name.casefold())
+    return tuple((1, int(part)) if part.isdigit() else (0, part) for part in parts), name
+
+
+def local_review_dir(state, kind, root):
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", root.name).strip("._-") or "folder"
+    return state.repo_root / "reviews" / kind / f"{name[:80]}-{digest}"
+
+
 def fetch_local_track(root, track):
     image_dirs = [root / track / "MEDICANES-WC-DC" / "Images", root / track / "Images"]
     image_dir = next((path for path in image_dirs if path.is_dir()), None)
@@ -298,12 +311,46 @@ def connect_local_folder(state, folder):
         raise ValueError("No Track* folders found in the selected folder.")
     state.local_root = root
     state.local_mode = True
+    state.flat_mode = False
+    state.flat_root = None
     state.data_root = root
     state.atlas_tracks = tracks
     state.atlas_cache = {}
     state.atlas_track = ""
     set_atlas_samples(state, [])
     return tracks
+
+
+def connect_flat_folder(state, folder):
+    if not folder.strip():
+        raise ValueError("Choose a folder first.")
+    root = Path(folder).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"Folder not found: {root}")
+    images = sorted((path for path in root.iterdir()
+                     if path.is_file() and not path.is_symlink()
+                     and path.suffix.lower() in (".jpg", ".jpeg", ".png")),
+                    key=lambda path: natural_name_key(path.name))
+    if not images:
+        raise ValueError("No JPG or PNG images found directly in this folder.")
+    output_dir = local_review_dir(state, "flat", root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    migrate_reviews(output_dir)
+    state.samples = [dict(index=index, sample_id=path.name, label=None, unlabelled=1,
+                          images=[str(path)], metadata={}) for index, path in enumerate(images)]
+    state.data_root = root
+    state.output_dir = output_dir
+    state.atlas_mode = False
+    state.local_mode = False
+    state.local_root = None
+    state.flat_mode = True
+    state.flat_root = root
+    state.atlas_tracks = []
+    state.atlas_cache = {}
+    state.atlas_track = ""
+    state.remote_base_url = ""
+    state.missing_images = []
+    return len(images)
 
 
 def choose_local_folder():
@@ -314,7 +361,7 @@ def choose_local_folder():
         window.withdraw()
         window.attributes("-topmost", True)
         try:
-            return filedialog.askdirectory(parent=window, title="Select track folder")
+            return filedialog.askdirectory(parent=window, title="Select image folder")
         finally:
             window.destroy()
     except Exception as exc:
@@ -328,9 +375,7 @@ def set_atlas_samples(state, samples):
     state.atlas_mode = True
     state.remote_base_url = "" if state.local_mode else ATLAS_URL
     if state.local_mode:
-        digest = hashlib.sha256(str(state.local_root).encode("utf-8")).hexdigest()[:10]
-        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", state.local_root.name).strip("._-") or "folder"
-        state.output_dir = state.repo_root / "reviews/local" / f"{name[:80]}-{digest}"
+        state.output_dir = local_review_dir(state, "local", state.local_root)
     else:
         state.output_dir = state.repo_root / "reviews/atlas"
     state.output_dir.mkdir(parents=True, exist_ok=True)
@@ -360,6 +405,8 @@ def connect_atlas(state):
     was_local = state.local_mode
     state.local_mode = False
     state.local_root = None
+    state.flat_mode = False
+    state.flat_root = None
     if was_local or not state.atlas_mode:
         set_atlas_samples(state, [])
     state.atlas_mode = True
@@ -933,6 +980,7 @@ HTML_PAGE = r"""<!doctype html>
         <div class="source-actions">
           <button id="connectAtlas">Connect to atlas</button>
           <button id="openLocalFolder">Open local folder</button>
+          <button id="openFlatFolder">Open image folder</button>
         </div>
         <div class="sub" id="source"></div>
       </div>
@@ -988,8 +1036,8 @@ HTML_PAGE = r"""<!doctype html>
     </section>
   </main>
   <dialog id="folderDialog">
-    <h2>Open local tracks</h2>
-    <label for="folderPath">Folder containing Track* directories</label>
+    <h2 id="folderDialogTitle">Open local tracks</h2>
+    <label id="folderDialogLabel" for="folderPath">Folder containing Track* directories</label>
     <div class="folder-field">
       <input id="folderPath" autocomplete="off" placeholder="Absolute folder path">
       <button id="browseFolder" type="button">Browse</button>
@@ -1014,6 +1062,7 @@ const state = {
   otherReviewsVisible: false,
   tracks: [],
   trackIndex: -1,
+  folderKind: "tracks",
 };
 
 const els = {
@@ -1041,6 +1090,8 @@ const els = {
   jumpUnreviewed: document.getElementById("jumpUnreviewed"),
   samplePicker: document.getElementById("samplePicker"),
   folderDialog: document.getElementById("folderDialog"),
+  folderDialogTitle: document.getElementById("folderDialogTitle"),
+  folderDialogLabel: document.getElementById("folderDialogLabel"),
   folderPath: document.getElementById("folderPath"),
   folderError: document.getElementById("folderError"),
   browseFolder: document.getElementById("browseFolder"),
@@ -1048,7 +1099,12 @@ const els = {
 };
 
 function sourceName() {
+  if (state.config?.flat_mode) return "Images · " + state.config.flat_root;
   return state.config?.local_mode ? "Local · " + state.config.local_root : "Atlas";
+}
+
+function unlabelledMode() {
+  return !!(state.config?.atlas_mode || state.config?.flat_mode);
 }
 
 function sampleDisplayName(sample) {
@@ -1071,13 +1127,13 @@ function updateControls() {
   els.switch.disabled = disabled;
   els.discard.disabled = disabled;
   els.notes.disabled = disabled;
-  els.keep.textContent = state.config?.atlas_mode ? "Negative" : "Keep";
-  els.switch.textContent = state.config?.atlas_mode ? "Warm core" : "Switch";
+  els.keep.textContent = unlabelledMode() ? "Negative" : "Keep";
+  els.switch.textContent = unlabelledMode() ? "Warm core" : "Switch";
   els.confirmReviewer.textContent = state.reviewerConfirmed ? "Change" : "OK";
 }
 
 function currentList() {
-  if (state.config?.atlas_mode) return state.samples;
+  if (unlabelledMode()) return state.samples;
   return state.byLabel[state.label] || [];
 }
 
@@ -1208,7 +1264,7 @@ function revealCurrentSample() {
 }
 
 function render() {
-  if (!state.config?.atlas_mode && !currentList().length) {
+  if (!unlabelledMode() && !currentList().length) {
     const fallbackLabel = Object.keys(state.byLabel).find(label => state.byLabel[label].length > 0);
     if (fallbackLabel !== undefined && Number(fallbackLabel) !== state.label) {
       state.label = Number(fallbackLabel);
@@ -1418,6 +1474,7 @@ async function init() {
   };
   els.source.textContent = payload.config.atlas_mode
     ? `${sourceName()} · ${payload.config.atlas_track || "no track selected"}`
+    : payload.config.flat_mode ? `${sourceName()} · ${state.samples.length} images`
     : `${payload.config.input_csv} · ${state.samples.length} samples`;
 
   document.querySelectorAll(".tabs button").forEach(button => {
@@ -1442,8 +1499,8 @@ async function init() {
     render();
     refreshOtherReviewsIfVisible();
   });
-  els.keep.addEventListener("click", () => save(state.config.atlas_mode ? 0 : currentSample().label));
-  els.switch.addEventListener("click", () => save(state.config.atlas_mode ? 1 : currentSample().label === 0 ? 1 : 0));
+  els.keep.addEventListener("click", () => save(unlabelledMode() ? 0 : currentSample().label));
+  els.switch.addEventListener("click", () => save(unlabelledMode() ? 1 : currentSample().label === 0 ? 1 : 0));
   els.discard.addEventListener("click", () => save(currentSample().label, "discard"));
   els.showOtherReviews.addEventListener("click", toggleOtherReviews);
   els.jumpUnreviewed.addEventListener("click", jumpUnreviewed);
@@ -1452,16 +1509,14 @@ async function init() {
     if (event.target.matches("input, textarea")) return;
     if (event.key === "ArrowLeft") next(-1);
     if (event.key === "ArrowRight") next(1);
-    if (!controlsDisabled() && event.key.toLowerCase() === "k") save(state.config.atlas_mode ? 0 : currentSample().label);
-    if (!controlsDisabled() && event.key.toLowerCase() === "s") save(state.config.atlas_mode ? 1 : currentSample().label === 0 ? 1 : 0);
+    if (!controlsDisabled() && event.key.toLowerCase() === "k") save(unlabelledMode() ? 0 : currentSample().label);
+    if (!controlsDisabled() && event.key.toLowerCase() === "s") save(unlabelledMode() ? 1 : currentSample().label === 0 ? 1 : 0);
   });
 
   state.reviewerConfirmed = false;
   document.getElementById("connectAtlas").addEventListener("click", connectAtlas);
-  document.getElementById("openLocalFolder").addEventListener("click", () => {
-    els.folderError.textContent = "";
-    els.folderDialog.showModal();
-  });
+  document.getElementById("openLocalFolder").addEventListener("click", () => openFolderDialog("tracks"));
+  document.getElementById("openFlatFolder").addEventListener("click", () => openFolderDialog("images"));
   document.getElementById("cancelFolder").addEventListener("click", () => els.folderDialog.close());
   els.browseFolder.addEventListener("click", async () => {
     els.browseFolder.disabled = true;
@@ -1472,11 +1527,21 @@ async function init() {
     finally { els.browseFolder.disabled = false; }
   });
   els.loadFolder.addEventListener("click", connectLocalFolder);
-  document.querySelector(".tabs").hidden = !!state.config.atlas_mode;
+  document.querySelector(".tabs").hidden = unlabelledMode();
   state.tracks = (await fetchJson("/api/atlas/tracks")).tracks;
   state.trackIndex = state.tracks.indexOf(state.config.atlas_track);
   setStatus("Enter a reviewer name and press OK to start.");
   render();
+}
+
+function openFolderDialog(kind) {
+  if (state.folderKind !== kind) els.folderPath.value = "";
+  state.folderKind = kind;
+  els.folderDialogTitle.textContent = kind === "tracks" ? "Open local tracks" : "Open image folder";
+  els.folderDialogLabel.textContent = kind === "tracks"
+    ? "Folder containing Track* directories" : "Folder containing images";
+  els.folderError.textContent = "";
+  els.folderDialog.showModal();
 }
 
 async function connectAtlas() {
@@ -1513,11 +1578,12 @@ async function connectLocalFolder() {
   state.loading = true;
   updateControls();
   try {
-    const payload = await fetchJson("/api/local/connect", {
+    const flat = state.folderKind === "images";
+    const payload = await fetchJson(flat ? "/api/flat/connect" : "/api/local/connect", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({folder}),
     });
-    state.tracks = payload.tracks;
+    state.tracks = payload.tracks || [];
     const dataset = await fetchJson("/api/samples");
     state.samples = dataset.samples;
     state.config = dataset.config;
@@ -1525,13 +1591,13 @@ async function connectLocalFolder() {
     state.trackIndex = -1;
     state.completionAlertShown = false;
     document.querySelector(".tabs").hidden = true;
-    els.source.textContent = `${sourceName()} · ${state.tracks.length} tracks`;
+    els.source.textContent = `${sourceName()} · ${flat ? state.samples.length + " images" : state.tracks.length + " tracks"}`;
     hideOtherReviews();
     state.reviews = {};
     if (state.reviewerConfirmed) await loadReviews();
     els.folderDialog.close();
     render();
-    setStatus("Select a track to load its images.");
+    setStatus(flat ? `${state.samples.length} images loaded.` : "Select a track to load its images.");
   } catch (error) { els.folderError.textContent = error.message; }
   finally { els.loadFolder.disabled = false; state.loading = false; updateControls(); }
 }
@@ -1627,6 +1693,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     tracks = connect_local_folder(self.state, str(payload.get("folder", "")))
                 self.send_json({"ok": True, "tracks": tracks})
                 return
+            if parsed.path == "/api/flat/connect":
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                with self.state.atlas_lock:
+                    count = connect_flat_folder(self.state, str(payload.get("folder", "")))
+                self.send_json({"ok": True, "count": count})
+                return
             if parsed.path == "/api/atlas/track":
                 length = int(self.headers.get("Content-Length") or "0")
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -1659,6 +1732,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "atlas_mode": state.atlas_mode,
                     "local_mode": state.local_mode,
                     "local_root": str(state.local_root) if state.local_root else "",
+                    "flat_mode": state.flat_mode,
+                    "flat_root": str(state.flat_root) if state.flat_root else "",
                     "atlas_track": state.atlas_track,
                     "atlas_track_counts": {track: len(samples) for track, samples in state.atlas_cache.items()},
                 },

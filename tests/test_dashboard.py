@@ -11,7 +11,7 @@ from unittest.mock import patch
 from io import BytesIO
 from urllib.error import HTTPError
 from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +24,74 @@ spec.loader.exec_module(dashboard)
 
 
 class StandaloneTests(unittest.TestCase):
+    def test_flat_image_folder_keeps_independent_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / 'loose images'
+            folder.mkdir()
+            for name in ('image10.jpg', 'image2.PNG', 'image1.jpeg'):
+                (folder / name).write_bytes(b'image')
+            (folder / 'notes.txt').write_text('not an image')
+            (folder / 'nested').mkdir()
+            (folder / 'nested' / 'image3.jpg').write_bytes(b'nested')
+            (root / 'outside.jpg').write_bytes(b'outside')
+            state = dashboard.AppState(root, root / 'none.csv', root, root / 'reviews')
+            self.assertEqual(dashboard.connect_flat_folder(state, str(folder)), 3)
+            self.assertEqual([sample['sample_id'] for sample in state.samples],
+                             ['image1.jpeg', 'image2.PNG', 'image10.jpg'])
+            self.assertTrue(state.flat_mode)
+            self.assertFalse(state.atlas_mode)
+            self.assertEqual({sample['label'] for sample in state.samples}, {None})
+            for sample_id, label in (('image1.jpeg', 0), ('image2.PNG', 1)):
+                dashboard.save_review(state, {'reviewer': 'Test', 'sample_id': sample_id,
+                                              'reviewed_label': label})
+            review_path = dashboard.reviewer_file(state, 'Test')
+            with review_path.open(newline='') as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows, [{'sample_id': 'image1.jpeg', 'label': '0'},
+                                    {'sample_id': 'image2.PNG', 'label': '1'}])
+            output_dir = state.output_dir
+            dashboard.DashboardHandler.state = state
+            server = dashboard.ThreadingHTTPServer(('127.0.0.1', 0), dashboard.DashboardHandler)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            base = f'http://127.0.0.1:{server.server_port}'
+            try:
+                request = Request(base + '/api/flat/connect',
+                                  data=json.dumps({'folder': str(folder)}).encode(),
+                                  headers={'Content-Type': 'application/json'}, method='POST')
+                with urlopen(request) as response:
+                    self.assertEqual(json.load(response)['count'], 3)
+                with urlopen(base + '/api/samples') as response:
+                    self.assertTrue(json.load(response)['config']['flat_mode'])
+                with urlopen(base + '/image?path=' + quote(str(folder / 'image2.PNG'))) as response:
+                    self.assertEqual(response.read(), b'image')
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(base + '/image?path=' + quote(str(root / 'outside.jpg')))
+                self.assertEqual(error.exception.code, 403)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+            dashboard.connect_flat_folder(state, str(folder))
+            self.assertEqual(state.output_dir, output_dir)
+            self.assertEqual(dashboard.labels_for_reviewer(state, 'Test')['image2.PNG']['reviewed_label'], '1')
+            track_root = root / 'tracks'
+            (track_root / 'Track0841').mkdir(parents=True)
+            dashboard.connect_local_folder(state, str(track_root))
+            self.assertFalse(state.flat_mode)
+            self.assertTrue(state.atlas_mode)
+            dashboard.connect_flat_folder(state, str(folder))
+            with patch.object(dashboard, 'atlas_tracks', return_value=['track00000841']):
+                dashboard.connect_atlas(state)
+            self.assertFalse(state.flat_mode)
+            self.assertEqual(state.output_dir, root / 'reviews/atlas')
+            empty = root / 'empty'
+            empty.mkdir()
+            with self.assertRaisesRegex(ValueError, 'No JPG or PNG'):
+                dashboard.connect_flat_folder(state, str(empty))
+            self.assertEqual(state.output_dir, root / 'reviews/atlas')
+
     def test_local_folder_tracks_and_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

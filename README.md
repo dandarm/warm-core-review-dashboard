@@ -13,9 +13,10 @@ From the project directory:
 python3 scripts/visual_review_dashboard.py --atlas
 ```
 
-The browser opens http://127.0.0.1:8765. Choose **Open local folder** to
-review a folder of track images, or **Connect to atlas** to use the public site.
-Neither option needs an input CSV listing images or labels. Enter a reviewer
+The browser opens http://127.0.0.1:8765. Choose **Open local folder** for
+track folders, **Open image folder** for loose images, or **Connect to atlas**
+to use the public site.
+None of these options needs an input CSV listing images or labels. Enter a reviewer
 name and press OK to enable decisions. Stop the server with Ctrl+C.
 Add `--no-browser` to skip opening the browser or `--port 8766` to change ports.
 
@@ -33,6 +34,14 @@ Local reviews are saved separately under `reviews/local/` for each folder.
 
 Some saved sample IDs end in `.npz` for compatibility with older reviews, but
 no NPZ files are needed. The dashboard shows the date, time, and satellite.
+
+## Loose image folders
+
+Click **Open image folder** and select a folder containing JPG or PNG files.
+Only images directly in that folder are listed. Each image appears separately,
+in natural filename order, and receives its own label. Use the list or the
+previous/next buttons to navigate. Reviews are saved under `reviews/flat/`,
+separately for each folder.
 
 ## Public atlas images
 
